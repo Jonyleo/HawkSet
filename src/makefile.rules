@@ -1,0 +1,110 @@
+# vim: filetype=make
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS :=
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS :=
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS :=
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS :=
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS := 
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Define the sanity subset ######
+
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+ifdef DEBUG
+$(info BUILDING DEBUG MODE)
+TOOL_CXXFLAGS+="-DDEBUG" -ggdb
+endif
+
+ifdef NO_BACKTRACE
+$(info BUILDING NO BACKTRACE MODE)
+TOOL_CXXFLAGS+="-DNO_BACKTRACE"
+endif
+
+YAML_ROOT=$(TOOL_ROOT)/dependencies/libyaml
+
+YAML_HEADER=$(YAML_ROOT)/src/yaml_private.h 
+YAML_FILES=api.c reader.c scanner.c parser.c loader.c writer.c emitter.c dumper.c
+YAML_SOURCES=$(addprefix $(YAML_ROOT)/src/, $(YAML_FILES))
+YAML_OBJ=$(addprefix $(OBJDIR), $(YAML_FILES:c=o))
+YAML_INCLUDE=-I$(YAML_ROOT)/include
+YAML_VERSION= -D YAML_VERSION_MAJOR=0 -D YAML_VERSION_MINOR=2 -D YAML_VERSION_PATCH=5 -D YAML_VERSION_STRING=\"0.2.5\"
+
+SOURCE_FILES=logger.hpp trace.hpp utils.hpp lockset.hpp vector_clock.hpp
+
+$(OBJDIR)%.o: $(YAML_ROOT)/src/%.c $(YAML_HEADER)
+	$(CXX) $(TOOL_CXXFLAGS) -std=c++2a -c $? $(YAML_INCLUDE) $(YAML_VERSION)
+	mv $(notdir $@) $(OBJDIR)
+
+$(OBJDIR)libyaml.a: $(YAML_OBJ)
+	ar -rcs $(OBJDIR)libyaml.a $(YAML_OBJ)
+
+$(OBJDIR)%$(OBJ_SUFFIX): %.cpp $(SOURCE_FILES) 
+	$(CXX) $(TOOL_CXXFLAGS) -std=c++2a $(COMP_OBJ)$@ $< $(YAML_INCLUDE) -I${PIN_ROOT}/extras/libunwind/include
+
+$(OBJDIR)hawkset$(PINTOOL_SUFFIX): $(OBJDIR)hawkset$(OBJ_SUFFIX) $(OBJDIR)lockset$(OBJ_SUFFIX) $(CONTROLLERLIB) $(OBJDIR)libyaml.a
+	$(LINKER) $(TOOL_LDFLAGS) -std=c++2a  $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)
+	
