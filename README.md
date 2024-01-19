@@ -1,4 +1,4 @@
-# Concurrent PM bug detector
+# HawkSet
 
 This repo contains the source code for HawkSet, an automatic, application-agnostic, and efficient concurrent PM bug detector
 
