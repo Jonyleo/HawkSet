@@ -7,7 +7,6 @@
 #include <syscall.h>
 #endif
 
-#include <libunwind.h>
 #include <execinfo.h>
 #include <unistd.h>
 
@@ -34,33 +33,32 @@ static const char *pm_mount;
 
 // Structure used when instrumenting mmap allocations
 struct PMAllocation {
-    PMAllocation(uint64_t size) : size(size), start(0), end(size) {}
-    PMAllocation() : PMAllocation(0) {}
+    PMAllocation(uint64_t size, char * path, uint64_t flags, uint64_t prot) 
+        : size(size), start(0), end(size), path(path), flags(flags), prot(prot) {}
+    PMAllocation() {}
 
-    inline uint64_t get_size() const { return size; }
-
-    inline uint64_t get_start() const { return start; }
-
-    inline uint64_t get_end() const { return end; }
 
     void set_start(uint64_t new_start) { start = new_start; end = start+size; }
 
     uint64_t size;
     uint64_t start;
     uint64_t end;
+    std::string path;
+    uint64_t flags;
+    uint64_t prot;
+    bool unmapped = false;
 };
 
 std::vector<PMAllocation> allocs;
 int n_allocs = 0;
 
-bool FDPointsToPM(int fd) {
+bool FDPointsToPM(int fd, char file_path[1000]) {
     char fd_path[32];
     sprintf(fd_path, "/proc/self/fd/%d", fd);
-    char file_path[100];
-    int size = readlink(fd_path, file_path, 100);
+    int size = readlink(fd_path, file_path, 1000);
     file_path[size] = '\0';
-    LOG("PM allocation (" + std::to_string(fd) + ")" + "- " + std::string(file_path) + " - ");
 
+    LOG("PM allocation (" + std::to_string(fd) + ")" + "- " + std::string(file_path) + "\n");
     if (size != -1) {
         int i = 0;
         while (pm_mount[i] != '\0' && i <= size) {
@@ -72,23 +70,39 @@ bool FDPointsToPM(int fd) {
     return false;
 }
 
-// Save the size for mmap allocation
-VOID SysBefore(ADDRINT ip, ADDRINT num, ADDRINT size, ADDRINT flags,
-               ADDRINT fd) {
+VOID SysBefore(uint64_t ip, uint64_t num, uint64_t size, uint64_t flags,
+               uint64_t fd, uint64_t prot, uint64_t address) {
+
+    char file_path[1000];
+    if(num == SYS_munmap) {
+        for(PMAllocation &alloc : allocs) {
+            if(alloc.start == address && alloc.size == size) {
+                alloc.unmapped = true;
+            }
+        }
+    }
+
     // If the mmap call is not creating a private mapping, that is, they use the
     // MAP_SHARED or MAP_SHARED_VALIDATE flags.
     if (num == SYS_mmap &&
         (((flags & 0x01) == 0x01) || ((flags & 0x03) == 0x03)) &&
-        FDPointsToPM(fd)) {
-        LOG("size: " + std::to_string((uint64_t) size));
-        allocs.emplace_back(size);
+        FDPointsToPM(fd, file_path)) {
+        LOG("size: " + std::to_string((uint64_t) size) + "\n");
+        allocs.emplace_back(size, file_path, flags, prot);
         found_alloc = true;
     }
 }
 
-// Save the returned memory address for each allocation
-VOID SysAfter(ADDRINT return_value) {
+VOID SysAfter(uint64_t return_value) {
     if (found_alloc == true) {
+
+        if(return_value == (uint64_t) (-1)) {
+            LOG("failed\n");
+            allocs.pop_back();
+            found_alloc = false;
+            return;
+        }
+
         allocs.back().set_start(return_value);
         found_alloc = false;
         LOG("start: " + std::to_string((uint64_t) return_value) + "\n");
@@ -101,7 +115,9 @@ VOID SyscallEntry(THREADID thread, CONTEXT *ctxt, SYSCALL_STANDARD std,
               PIN_GetSyscallNumber(ctxt, std),
               PIN_GetSyscallArgument(ctxt, std, 1),
               PIN_GetSyscallArgument(ctxt, std, 3),
-              PIN_GetSyscallArgument(ctxt, std, 4));
+              PIN_GetSyscallArgument(ctxt, std, 4),
+              PIN_GetSyscallArgument(ctxt, std, 2),
+              PIN_GetSyscallArgument(ctxt, std, 0));
 }
 
 VOID SyscallExit(THREADID thread, CONTEXT *ctxt, SYSCALL_STANDARD std,
@@ -110,20 +126,37 @@ VOID SyscallExit(THREADID thread, CONTEXT *ctxt, SYSCALL_STANDARD std,
 }
 
 // Function will return true if the write is operating on Pmem
-inline bool IsPMAddress(ADDRINT address, uint32_t size, uint64_t tid) {
+bool IsPMAddress(uint64_t address, uint32_t size, uint64_t tid) {
     bool res;
 COUNT_TIME_GENERIC(ispm_time, {
     uint64_t range_end = address + size;
     res = false;
     for(const auto& allocation : allocs) {
-        if ((address >= allocation.get_start()) &&
-            ((range_end) <= (allocation.get_end()))) {
+        if (allocation.unmapped == false &&
+            (address >= allocation.start) &&
+            ((range_end) <= (allocation.end))) {
             res = true;
             break;
         }
     }
 })
     return res;
+}
+
+bool IsLeave(int opcode) {
+    return opcode == XED_ICLASS_LEAVE_DEFINED;
+}
+
+bool IsFrameSetup(INS ins) {
+    return INS_OperandCount(ins) == 2 &&
+           INS_OperandIsReg(ins, 0) && 
+           INS_OperandIsReg(ins, 1) &&
+           INS_OperandReg(ins, 0) == REG_RBP &&  
+           INS_OperandReg(ins, 1) == REG_STACK_PTR &&
+           INS_IsMov(ins) &&
+           ! INS_IsMemoryRead(ins) &&
+           ! INS_IsMemoryWrite(ins);
+
 }
 
 // Function to check if instruction is a non-temporal store
@@ -217,6 +250,10 @@ static std::string _GetBacktraceSymbols(void**addresses, size_t size) {
     return trace;
 }
 
+inline bool addr_colision(uint64_t a1, uint32_t s1, uint64_t a2, uint32_t s2) {
+    return (a1 + s1) > a2 && (a2 + s2) > a1;
+}
+
 #ifdef NO_BACKTRACE
 typedef void* backtrace_t;
 
@@ -254,7 +291,7 @@ size_t get_traces_size() {
     return s;
 }
 
-int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth) {
+int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth, bool frame_pointer_only) {
     if(depth==0)
         return 0;
 
@@ -267,72 +304,53 @@ int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth) {
     if(depth==1)
         return 1;
 
-    uint64_t* frame = (uint64_t*) PIN_GetContextReg(ctxt, REG_RBP);
-    uint64_t* old_frame = (uint64_t *) PIN_GetContextReg(ctxt, REG_RSP);
+    uint64_t* frame_ptr = (uint64_t*) PIN_GetContextReg(ctxt, REG_RBP);
+    uint64_t* stack_ptr = (uint64_t *) PIN_GetContextReg(ctxt, REG_RSP);
+    
+    if(i < depth && frame_ptr && stack_ptr) {
+        if(!frame_pointer_only) {
+            uint64_t p = *(stack_ptr);
+            if(p) {
+                addresses[i++] = (void *) p;
+            }
+        }
+    }
 
-    while(i < depth && frame) {
-        if(((uint64_t)(std::max(frame, old_frame) - std::min(frame,old_frame))) > 0x10000) {
+    while(i < depth && frame_ptr) {
+        if(((uint64_t)(std::max(frame_ptr, stack_ptr) - std::min(frame_ptr,stack_ptr))) > 0x10000) {
             break;
         }
-        old_frame = frame;
+        stack_ptr = frame_ptr;
 
-        addresses[i++] = (void *) *(frame+1);
-        frame = (uint64_t*) *(frame);
+        addresses[i++] = (void *) *(frame_ptr+1);
+        frame_ptr = (uint64_t*) *(frame_ptr);
     }
+
 
     return i;
 } 
 
-int StackUnwind(const CONTEXT *ctxt, void ** addresses, uint64_t depth) { 
-    if(depth == 0)
-        return 0;
-    
-    unw_context_t uc;
-    unw_cursor_t cursor;
-    PIN_LockClient();
-    unw_init_local(&cursor, &uc);
-    PIN_GetInitialContextForUnwind(ctxt, &cursor);
-
-
-    uint64_t i = 0;
-
-    unw_get_reg(&cursor, UNW_REG_IP, (unw_word_t*) &addresses[i]);
-    while (++i < depth) {
-        int res = unw_step(&cursor);
-
-        if(res == 0)
-            break;
-
-        if(res < 0) {
-            perror("libunwind");
-            PIN_ExitApplication(-1);
-        }
-
-        unw_get_reg(&cursor, UNW_REG_IP, (unw_word_t*) &addresses[i]);
-    }
-    PIN_UnlockClient();
-
-    return i;
-}
-
 extern PIN_MUTEX backtrace_mutex;
 
-backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth) {
-    void * addresses[depth];
-    int num_addresses;
+backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth, std::vector<void*> trace) {
+    
+
     backtrace_t ret = nullptr;
+   
+    /*void * addresses[depth];
+    int num_addresses;
+    PIN_LockClient();
+    num_addresses = PIN_Backtrace(ctxt, addresses, depth);
+    PIN_UnlockClient();
 
+    std::vector<void*> vec(addresses, addresses + num_addresses);*/
     
-    //PIN_LockClient();
-    //num_addresses = PIN_Backtrace(ctxt, addresses, depth);
-    //PIN_UnlockClient();
-    
-    
-    num_addresses = CustomBackTrace(ctxt, addresses, depth);
+    //num_addresses = CustomBackTrace(ctxt, addresses, depth, frame_pointer_only);
 
-    //num_addresses = StackUnwind(ctxt, addresses, depth);
 
-    std::vector<void*> vec(addresses, addresses + num_addresses);
+
+    std::vector<void*> vec(trace.rbegin(), trace.rend());
+    vec.insert(vec.begin(), (void*) PIN_GetContextReg(ctxt, REG_INST_PTR));
     
     PIN_MutexLock(&backtrace_mutex);
 
@@ -340,7 +358,7 @@ backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth) {
 
     if(vec_it == backtraces.end()) {
         vec_it = backtraces.insert(
-            new std::vector<void *>(addresses, addresses + num_addresses)
+            new std::vector<void *>(vec)
         ).first;
     } 
 
@@ -351,68 +369,6 @@ backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth) {
 
 #endif
 
-void InstrumentAdqRelRoutine(IMG img, const char * name, AFUNPTR beforePtr, AFUNPTR afterPtr,
-    uint64_t value_passed = 0) {
-
-    RTN routine = RTN_FindByName(img, name);
-
-    if(RTN_Valid(routine)) {
-        debug("Instrument %s: %p - %p || %ld\n", name, beforePtr, afterPtr, value_passed);
-
-        RTN_Open(routine);
-
-        RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
-                                IARG_THREAD_ID,
-                                IARG_RETURN_IP,
-                                IARG_UINT64, value_passed,
-                                IARG_END);
-
-
-        RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
-                                IARG_THREAD_ID,
-                                IARG_UINT64, value_passed,
-                                IARG_END);
-        
-
-        RTN_Close(routine);
-    }
-}
-
-void InstrumentLockRoutine(IMG img, const char * name, AFUNPTR beforePtr, AFUNPTR afterPtr = NULL,
-    int argument_index = 0, uint64_t constant_value = 0, bool negate = false) {
-
-    RTN routine = RTN_FindByName(img, name);
-
-    if(RTN_Valid(routine)) {
-        debug("Instrument %s: %p - %p || %d %ld %d\n", name, beforePtr, afterPtr, argument_index, constant_value, (int)negate);
-
-        RTN_Open(routine);
-
-        if(afterPtr) {
-            RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
-                                IARG_THREAD_ID,
-                                IARG_RETURN_IP,
-                                IARG_FUNCARG_ENTRYPOINT_VALUE, argument_index,
-                                IARG_END);
-
-
-            RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
-                                    IARG_THREAD_ID,
-                                    IARG_FUNCRET_EXITPOINT_VALUE,
-                                    IARG_UINT64, constant_value,
-                                    IARG_UINT64, negate,
-                                    IARG_END);
-        } else {
-            RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
-                                IARG_THREAD_ID,
-                                IARG_RETURN_IP,
-                                IARG_FUNCARG_ENTRYPOINT_VALUE, argument_index,
-                                IARG_END);
-        }
-
-        RTN_Close(routine);
-    }
-}
 
 enum LockType {MUTEX, WRITE, READ};
 enum MemState {DIRTY, FLUSHED};
@@ -452,6 +408,34 @@ struct std::hash<std::pair<backtrace_t, uint64_t>> {
     }
 };
 
+template<>
+struct std::hash<std::tuple<backtrace_t, backtrace_t, bool>> {
+    std::size_t operator()(const std::tuple<backtrace_t, backtrace_t, bool> &t) const {
+        
+        return std::hash<backtrace_t>()(std::get<0>(t)) ^
+               std::hash<backtrace_t>()(std::get<1>(t)) ^ 
+               std::hash<uint64_t>()((uint64_t) std::get<2>(t));
+    }
+};
+
+
+template<>
+struct std::hash<std::pair<backtrace_t, backtrace_t>> {
+    std::size_t operator()(const std::pair<backtrace_t, backtrace_t> &p) const {
+        return std::hash<backtrace_t>()(p.first) ^
+               std::hash<backtrace_t>()(p.second);
+    }
+};
+
+template<>
+struct std::hash<std::tuple<uint64_t, bool, bool>> {
+    std::size_t operator()(const std::tuple<uint64_t, bool, bool> &t) const {
+        return std::hash<uint64_t>()(std::get<0>(t)) ^
+               std::hash<uint64_t>()((uint64_t) std::get<1>(t)) ^ 
+               std::hash<uint64_t>()((uint64_t) std::get<2>(t));
+    }
+};
+
 static void parseError(std::string filename, const char *msg, int val) {
     if(!val) {
         debug("Failed to parse %s: %s\n", filename.c_str(), msg);
@@ -470,9 +454,11 @@ std::map<std::string, enum LockType> mutexTypes = {
 
 struct MutexFunctionInfo{
     std::string name;
-    int mutex_id_arg;
-    int success_value;
-    bool success_is_failure;
+    int mutex_id_arg = -1;
+    int result_id_arg = -1;
+    int success_value = 0;
+    bool success_is_failure = false;
+    bool use_result_arg = false;
     enum LockType type;
 
     MutexFunctionInfo(char * _name, yaml_node_t * node, yaml_document_t * document) {
@@ -488,6 +474,9 @@ struct MutexFunctionInfo{
                 case YAML_SCALAR_NODE:
                     if(!strcmp((char *)key_node->data.scalar.value, "mutex_id_arg")) {
                         mutex_id_arg = atoi((char *)value_node->data.scalar.value);
+                    } else if(!strcmp((char *)key_node->data.scalar.value, "result_id_arg")) {
+                        result_id_arg = atoi((char *)value_node->data.scalar.value);
+                        use_result_arg = true;
                     } else if(!strcmp((char *)key_node->data.scalar.value, "success_value")) {
                         success_value = atoi((char *)value_node->data.scalar.value);
                         success_is_failure = false;
@@ -648,4 +637,87 @@ private:
         }
     }
 };
+
+void InstrumentAdqRelRoutine(IMG img, const char * name, AFUNPTR beforePtr, AFUNPTR afterPtr,
+    uint64_t value_passed = 0) {
+
+    RTN routine = RTN_FindByName(img, name);
+
+    if(RTN_Valid(routine)) {
+        debug("Instrument %s: %p - %p || %ld\n", name, beforePtr, afterPtr, value_passed);
+
+        RTN_Open(routine);
+
+        RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
+                                IARG_CONST_CONTEXT,
+                                IARG_THREAD_ID,
+                                IARG_RETURN_IP,
+                                IARG_UINT64, value_passed,
+                                IARG_END);
+
+
+        RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
+                                IARG_CONST_CONTEXT,
+                                IARG_THREAD_ID,
+                                IARG_UINT64, value_passed,
+                                IARG_END);
+        
+
+        RTN_Close(routine);
+    }
+}
+
+void InstrumentLockRoutine(IMG img, AFUNPTR beforePtr, const MutexFunctionInfo &info, AFUNPTR afterPtr = NULL) {
+
+    RTN routine = RTN_FindByName(img, info.name.c_str());
+
+    if(RTN_Valid(routine)) {
+        debug("Instrument %s - %d %d %d %d %d\n", info.name.c_str(), info.mutex_id_arg, info.result_id_arg, info.success_value, info.success_is_failure, info.use_result_arg);
+	
+        RTN_Open(routine);
+
+        if(afterPtr) {
+            if(info.use_result_arg) {
+                RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
+                                IARG_THREAD_ID,
+                                IARG_RETURN_IP,
+                                IARG_FUNCARG_ENTRYPOINT_VALUE, info.mutex_id_arg,
+                                IARG_FUNCARG_ENTRYPOINT_VALUE, info.result_id_arg,
+                                IARG_END);
+            } else {
+                RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
+                                IARG_THREAD_ID,
+                                IARG_RETURN_IP,
+                                IARG_FUNCARG_ENTRYPOINT_VALUE, info.mutex_id_arg,
+                                IARG_UINT64, 0,
+                                IARG_UINT64, info.type,
+                                IARG_END);
+            }
+            
+
+            RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
+                                        IARG_CONST_CONTEXT,
+                                        IARG_THREAD_ID,
+                                        IARG_FUNCRET_EXITPOINT_VALUE,
+                                        IARG_UINT64, info.success_value,
+                                        IARG_UINT64, info.success_is_failure,
+                                        IARG_UINT64, info.use_result_arg,
+                                        IARG_END);
+
+        } else {
+            RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
+                                IARG_CONST_CONTEXT,
+                                IARG_THREAD_ID,
+                                IARG_RETURN_IP,
+                                IARG_FUNCARG_ENTRYPOINT_VALUE, info.mutex_id_arg,
+                                IARG_END);
+        }
+
+        RTN_Close(routine);
+    }
+}
+
+
 #endif  // !MUMAK_UTILS
+
+

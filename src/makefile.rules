@@ -84,27 +84,14 @@ $(info BUILDING NO BACKTRACE MODE)
 TOOL_CXXFLAGS+="-DNO_BACKTRACE"
 endif
 
-YAML_ROOT=$(TOOL_ROOT)/dependencies/libyaml
-
-YAML_HEADER=$(YAML_ROOT)/src/yaml_private.h 
-YAML_FILES=api.c reader.c scanner.c parser.c loader.c writer.c emitter.c dumper.c
-YAML_SOURCES=$(addprefix $(YAML_ROOT)/src/, $(YAML_FILES))
-YAML_OBJ=$(addprefix $(OBJDIR), $(YAML_FILES:c=o))
 YAML_INCLUDE=-I$(YAML_ROOT)/include
-YAML_VERSION= -D YAML_VERSION_MAJOR=0 -D YAML_VERSION_MINOR=2 -D YAML_VERSION_PATCH=5 -D YAML_VERSION_STRING=\"0.2.5\"
 
-SOURCE_FILES=logger.hpp trace.hpp utils.hpp lockset.hpp vector_clock.hpp
+SOURCE_FILES=*.hpp
+OBJ_FILES=$(OBJDIR)lockset$(OBJ_SUFFIX)
 
-$(OBJDIR)%.o: $(YAML_ROOT)/src/%.c $(YAML_HEADER)
-	$(CXX) $(TOOL_CXXFLAGS) -std=c++2a -c $? $(YAML_INCLUDE) $(YAML_VERSION)
-	mv $(notdir $@) $(OBJDIR)
 
-$(OBJDIR)libyaml.a: $(YAML_OBJ)
-	ar -rcs $(OBJDIR)libyaml.a $(YAML_OBJ)
+$(OBJDIR)%$(OBJ_SUFFIX): %.cpp $(SOURCE_FILES)
+	$(CXX) $(TOOL_CXXFLAGS) -std=c++20 $(COMP_OBJ)$@ $< $(YAML_INCLUDE)
 
-$(OBJDIR)%$(OBJ_SUFFIX): %.cpp $(SOURCE_FILES) 
-	$(CXX) $(TOOL_CXXFLAGS) -std=c++2a $(COMP_OBJ)$@ $< $(YAML_INCLUDE) -I${PIN_ROOT}/extras/libunwind/include
-
-$(OBJDIR)hawkset$(PINTOOL_SUFFIX): $(OBJDIR)hawkset$(OBJ_SUFFIX) $(OBJDIR)lockset$(OBJ_SUFFIX) $(CONTROLLERLIB) $(OBJDIR)libyaml.a
-	$(LINKER) $(TOOL_LDFLAGS) -std=c++2a  $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)
-	
+$(OBJDIR)%$(PINTOOL_SUFFIX): $(OBJDIR)%$(OBJ_SUFFIX) $(OBJ_FILES) $(CONTROLLERLIB) $(YAML_ROOT)/libyaml.a
+	$(LINKER) $(TOOL_LDFLAGS) -std=c++20  $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)

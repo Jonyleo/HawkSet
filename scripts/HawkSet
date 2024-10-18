@@ -39,6 +39,7 @@ fi
 
 PMEM_IS_PMEM_FORCE=1 \
 ${profile} ${pin} ${debug}  \
+	-inline 0 \
 	-t ${pintool} \
 	-pm-mount ${PM_MOUNT} \
 	-cfg $TOOL_ROOT/config/pthread.cfg \

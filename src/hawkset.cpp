@@ -1,5 +1,5 @@
 /*
- *  HawkSet
+ *  HawkSet - An automatic, agnostic, and efficient concurrent PM bug detector
  */
 
 #include <execinfo.h>
@@ -19,15 +19,18 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
-#include <array>
 #include <utility>
 
 #include "pin.H"
 #include "trace.hpp"
 #include "utils.hpp"
+
+#define USE_PIN_SYNC
 #include "lockset.hpp"
 #include "vector_clock.hpp"
 #include "logger.hpp"
+
+#include "cache.hpp"
 
 
 KNOB<std::string> KnobOutPath(KNOB_MODE_WRITEONCE, "pintool", "out",
@@ -45,24 +48,28 @@ KNOB<int> KnobBacktraceDepth(KNOB_MODE_WRITEONCE, "pintool", "bt-depth",
 KNOB<std::string> KnobConfigFiles(KNOB_MODE_APPEND, "pintool", "cfg",
                               "", "Configuration file (repeatable)");
 
+KNOB<bool> KnobCheckUnpersistedWrites(KNOB_MODE_WRITEONCE, "pintool", "unpersisted",
+                                        "0", "Use unpersisted writes in the analysis");
 
-struct RaceLikelyPoint {
-    pLockSet common_set;
+bool check_unpersisted_stores;
+
+// StoreData from the algorithm described in atc's paper
+struct StoreFenceData {
+    pLockset common_set;
     uint16_t clock_i;
     backtrace_t write_trace;
     backtrace_t fence_trace;
     uint64_t address;
-    uint32_t size;
-    std::bitset<64> mask;
+    bool persisted;
+    bool was_flushed;
 
-    RaceLikelyPoint(pLockSet l, uint16_t t, backtrace_t wt, backtrace_t ft, uint64_t a, uint32_t s, std::bitset<64> m)
-        : common_set(l), clock_i(t), write_trace(wt), fence_trace(ft), address(a), size(s), mask(m) {}
+    StoreFenceData(pLockset l, uint16_t t, backtrace_t wt, backtrace_t ft, uint64_t a, bool p, bool f)
+        : common_set(l), clock_i(t), write_trace(wt), fence_trace(ft), address(a), persisted(p), was_flushed(f) {}
 };
 
-struct WriteData {
-    pTimedLockSet timed_lockset;
+struct StoreData {
+    pTimedLockset timed_lockset;
     backtrace_t backtrace;
-    uint32_t size;
 };
 
 int64_t  lockset_analysis_time = 0;
@@ -92,31 +99,40 @@ PIN_MUTEX variable_accessed_mutex;
 PIN_MUTEX thread_creation_mutex;
 PIN_MUTEX thread_exit_mutex;
 PIN_MUTEX backtrace_mutex;
+PIN_MUTEX lock_mutex;
 
-typedef std::set<pLockSet> lockset_set_t;
+// mutex -> trace -> count
+std::map<uint64_t, std::map<backtrace_t, uint64_t>> locking_count;
+std::map<uint64_t, std::map<backtrace_t, uint64_t>> unlocking_count;
 
+
+typedef std::set<pLockset> lockset_set_t;
+
+/* cache_line -> address -> state */
+typedef std::unordered_map<uint64_t, std::unordered_map<uint64_t, StoreData>> mem_state_t;
+typedef std::map<std::tuple<backtrace_t, backtrace_t, bool>, std::set<backtrace_t>>  reports_t;
 
 struct alignas(64) ThreadData {
-    TimedLockSet timed_lockset;
-    pTimedLockSet timedlockset_cached = NULL;
+    TimedLockset current_timedlockset;
+    pTimedLockset cached_timedlockset = NULL;
 
-    inline pTimedLockSet get_timedlockset() {
-        if(timedlockset_cached == NULL)
-            timedlockset_cached = timedlockset_cache_get(&timed_lockset);
+    inline pTimedLockset get_timedlockset() {
+        if(cached_timedlockset == NULL)
+            cached_timedlockset = timedlockset_cache_get(&current_timedlockset);
 
-        return timedlockset_cached;
+        return cached_timedlockset;
     }
 
     std::vector<VectorClock> vector_clocks;
 
-    std::vector<RaceLikelyPoint> race_likely_points;
+    std::vector<StoreFenceData> race_likely_stores;
     
     /*
     Access points:
         (address, backtrace, clock) -> locksets
     */
     std::unordered_map<access_key_t,
-        lockset_set_t> access_points;
+        lockset_set_t> race_likely_loads;
 
 
     /*
@@ -126,29 +142,25 @@ struct alignas(64) ThreadData {
     */
     std::unordered_map<uint64_t,
         std::unordered_map<std::pair<backtrace_t, uint64_t>,
-            std::vector<const lockset_set_t*>>> access_points_opt;
+            lockset_set_t>> race_likely_loads_opt;
 
     /*
     Cache
         cache_line -> address -> state
     */
-    std::unordered_map<uint64_t, 
-        std::unordered_map<uint64_t, 
-            WriteData>> mem_state;
-
-
-    std::unordered_map<uint64_t, 
-        std::unordered_map<uint64_t, 
-            WriteData>> flushed_mem_state;
+    mem_state_t mem_state;
+    mem_state_t flushed_mem_state;
 
 
     //uint64_t pthread_id;
     uint64_t tid;
 
     uint32_t lock_clock = 0;
-    uint64_t try_lock_mutex, try_lock_return_address;
+    uint64_t try_lock_mutex, try_lock_return_address, result_address;
 
     bool used = false;
+
+    std::vector<void*> stack;
 };
 
 
@@ -171,7 +183,7 @@ uint32_t get_next_id(ThreadData * tdata) {
 
 */
 
-bool IgnoreAccess_(uint64_t tid, uint64_t address) {
+bool IgnoreAccess(uint64_t tid, uint64_t address) {
     if(!variable_accessed_map.contains(tid))
         variable_accessed_map[tid] = variable_accessed_map.size();
 
@@ -206,7 +218,23 @@ bool IgnoreAccess_(uint64_t tid, uint64_t address) {
     }        
 }
 
-inline std::bitset<64> IgnoreAccess(uint64_t tid, uint64_t address, uint32_t size) {
+inline bool HandleAccessByte(uint64_t tid, uint64_t address) {
+    if(use_init_removal_heuristic_n == 0) {
+        return true;
+    }
+
+    bool ret;
+
+    PIN_MutexLock(&variable_accessed_mutex);
+
+    ret = !IgnoreAccess(tid, address);
+
+    PIN_MutexUnlock(&variable_accessed_mutex);
+
+    return ret;
+}
+
+inline std::bitset<64> HandleAccess(uint64_t tid, uint64_t address, uint32_t size) {
     std::bitset<64> mask;
 
     assert(size <= 64);
@@ -223,7 +251,7 @@ inline std::bitset<64> IgnoreAccess(uint64_t tid, uint64_t address, uint32_t siz
     PIN_MutexLock(&variable_accessed_mutex);
 
     for(size_t i = 0; i < size; i++) {
-        mask.set(i, !IgnoreAccess_(tid, address));
+        mask.set(i, !IgnoreAccess(tid, address));
     }
 
     PIN_MutexUnlock(&variable_accessed_mutex);
@@ -233,26 +261,50 @@ inline std::bitset<64> IgnoreAccess(uint64_t tid, uint64_t address, uint32_t siz
 void RegisterAccess(uint64_t tid, uint64_t ip, uint64_t address, uint32_t size, const CONTEXT *ctxt) {
     std::bitset<64> mask;
 
-    mask = IgnoreAccess(tid, address, size);
+    mask = HandleAccess(tid, address, size);
 
     if(mask.none())
-        return;
+        return; 
+
+    ThreadData * tdata = get_thread_data(tid);
 
 COUNT_TIME_GENERIC(backtrace_time, 
 #ifdef NO_BACKTRACE
     backtrace_t backtrace = (void *) ip;
 #else
-    backtrace_t backtrace = GetBacktrace(ctxt, backtrace_depth);
+    backtrace_t backtrace = GetBacktrace(ctxt, backtrace_depth, tdata->stack);
 #endif
 );
     
-    ThreadData * tdata = get_thread_data(tid);
     uint16_t clock_i = tdata->vector_clocks.size()-1;
 
     access_key_t key = {address, backtrace, clock_i, mask};
-    auto & access_points = tdata->access_points[key];
+    auto & race_likely_loads = tdata->race_likely_loads[key];
 
-    access_points.insert(tdata->get_timedlockset()->lockset);
+    Lockset access = std::move(tdata->get_timedlockset()->to_lockset());
+
+    race_likely_loads.insert(lockset_cache_get(&access));
+}
+
+void RegisterUnpersistedStore(uint64_t tid, uint64_t address, StoreData &data, pTimedLockset current_timedlockset, backtrace_t trace, bool was_flushed) {
+    if(!HandleAccessByte(tid, address))
+        return;
+
+    ThreadData * tdata = get_thread_data(tid);
+
+    pLockset common_set = intersect_timedlockset(current_timedlockset, data.timed_lockset);
+
+    StoreFenceData rlp(
+        common_set, 
+        tdata->vector_clocks.size()-1,
+        data.backtrace, 
+        trace,
+        address,
+        false,
+        was_flushed
+    );
+
+    tdata->race_likely_stores.push_back(rlp);
 }
 
 void ProcessFlush(uint64_t tid, uint64_t ip, trace::Instruction flushtype, uint64_t address) {
@@ -264,56 +316,56 @@ void ProcessFlush(uint64_t tid, uint64_t ip, trace::Instruction flushtype, uint6
     uint64_t cache_line = CACHE_LINE(address);
 
     if(!mem_state.contains(cache_line))
-        return;
+        return;    
 
     for(const auto & entry : mem_state[cache_line]) {
-        const WriteData * data = &entry.second;
-
-        flushed_mem_state[cache_line][entry.first]= *data;
+        flushed_mem_state[cache_line][entry.first] = entry.second;
     }
 
     mem_state.erase(cache_line);
 }
 
+void CheckOverwrite(uint64_t tid, uint64_t address, mem_state_t & mem_state, pTimedLockset ls, backtrace_t trace, bool was_flushed) {
+
+    uint64_t cl = CACHE_LINE(address);
+
+    auto & cache_line_state = mem_state[cl];
+
+    if(cache_line_state.contains(address)) {
+        RegisterUnpersistedStore(tid, address, cache_line_state[address], ls, trace, was_flushed);
+        cache_line_state.erase(address);
+    }
+}
+
 void ProcessStore(uint64_t tid, uint64_t ip, uint64_t address, uint32_t size, const CONTEXT *ctxt) {
     ThreadData * tdata = get_thread_data(tid);
 
-    IgnoreAccess(tid, address, size);
+    HandleAccess(tid, address, size);
 
-    uint64_t start = CACHE_LINE(address);
-    uint64_t end = CACHE_LINE(address + size - 1);
 
 COUNT_TIME_GENERIC(backtrace_time, 
 #ifdef NO_BACKTRACE
     backtrace_t backtrace = (void *) ip;
 #else
-    backtrace_t backtrace = GetBacktrace(ctxt, backtrace_depth);
+    backtrace_t backtrace = GetBacktrace(ctxt, backtrace_depth, tdata->stack);
 #endif
 );
 
-    pTimedLockSet timed_lockset = NULL;
+    pTimedLockset store_timedlockset = tdata->get_timedlockset();
+    StoreData data = {store_timedlockset, backtrace};
 
-    auto mem_state = &tdata->mem_state;
+    auto & mem_state = tdata->mem_state;
+    auto & flushed_mem_state = tdata->flushed_mem_state;
 
-    for(uint64_t cl = start; cl <= end; cl++) {
-        uint64_t slice_address = cl;
-        if(cl == start)
-            slice_address = address;
+    for(uint64_t addr = address; addr < address + size; addr++) {
+        if(check_unpersisted_stores) {
+            CheckOverwrite(tid, addr, mem_state, store_timedlockset, backtrace, false);
+            CheckOverwrite(tid, addr, flushed_mem_state, store_timedlockset, backtrace, true);
+        }
 
-        uint32_t slice_size = 64;
-        if(cl == end)
-            slice_size = size % 64;
-
-        if(timed_lockset == NULL)
-            timed_lockset = tdata->get_timedlockset();
-
-        WriteData data = {
-            timed_lockset, backtrace, slice_size
-        };
-
-        (*mem_state)[cl][slice_address] = data;
+        uint64_t cl = CACHE_LINE(addr);
+        mem_state[cl][addr] = data;
     }
-
 }
 
 void ProcessRead(uint64_t tid, uint64_t ip, uint64_t address, uint32_t size, const CONTEXT *ctxt) {
@@ -323,15 +375,12 @@ void ProcessRead(uint64_t tid, uint64_t ip, uint64_t address, uint32_t size, con
 void ProcessFence(uint64_t tid, uint64_t ip, bool is_rmw, const CONTEXT *ctxt, uint64_t address = 0, uint32_t size = 0) {
     ThreadData * tdata = get_thread_data(tid);
 
-
     if(is_rmw && size != 0) {
         ProcessStore(tid, ip, address, size, ctxt);
     }
-
     
     auto& mem_state = tdata->flushed_mem_state;
-    pTimedLockSet timed_lockset = tdata->get_timedlockset();
-
+    pTimedLockset fence_timedlockset = tdata->get_timedlockset();
 
     if(mem_state.empty())
         return;
@@ -345,14 +394,12 @@ void ProcessFence(uint64_t tid, uint64_t ip, bool is_rmw, const CONTEXT *ctxt, u
 
         // Iterate addresses
         for(const auto &write : cache_line_state) {
-            const WriteData *write_data = &write.second;
+            const StoreData *write_data = &write.second;
             assert(write_data != NULL);
 
             uint64_t address = write.first;
 
-            std::bitset<64> mask = IgnoreAccess(tid, address, write_data->size);
-
-            if(mask.none())
+            if(!HandleAccessByte(tid, address))
                 continue;
 
             if(backtrace == nullptr) {
@@ -360,55 +407,64 @@ void ProcessFence(uint64_t tid, uint64_t ip, bool is_rmw, const CONTEXT *ctxt, u
             #ifdef NO_BACKTRACE
                 backtrace = (void *) ip;
             #else
-                backtrace = GetBacktrace(ctxt, backtrace_depth);
+                backtrace = GetBacktrace(ctxt, backtrace_depth, tdata->stack);
             #endif
         );    
             }
 
-            pLockSet common_set;
+            pLockset common_set = intersect_timedlockset(fence_timedlockset, write_data->timed_lockset);
 
-            common_set = timed_lockset->intersect(write_data->timed_lockset);
-
-            RaceLikelyPoint rlp(
+            StoreFenceData rlp(
                 common_set, 
                 tdata->vector_clocks.size()-1,
                 write_data->backtrace, 
                 backtrace,
                 address,
-                write_data->size,
-                mask
+                true,
+                true
             );
 
-            tdata->race_likely_points.push_back(rlp);
+            tdata->race_likely_stores.push_back(rlp);
         }
     }
 
     mem_state.clear();
 }
 
-void ProcessLock(uint64_t tid, uint64_t ip, trace::Instruction locktype, uint64_t mutex, bool special = false) {
+void ProcessLock(const CONTEXT * ctxt, uint64_t tid, uint64_t ip, trace::Instruction locktype, uint64_t mutex, bool special = false) {
     ThreadData * tdata = get_thread_data(tid);
 
-    TimedLockSet * timed_lockset = &tdata->timed_lockset;
-    tdata->timedlockset_cached = NULL;
+    tdata->cached_timedlockset = NULL;
 
     switch(locktype) {
+        case trace::Instruction::TRY_LOCK:
+        case trace::Instruction::TRY_WRLOCK:
+        case trace::Instruction::TRY_RDLOCK:
         case trace::Instruction::LOCK:
         case trace::Instruction::WRLOCK:
         case trace::Instruction::RDLOCK:
+            PIN_MutexLock(&lock_mutex);
+            locking_count[mutex][GetBacktrace(ctxt, backtrace_depth, tdata->stack)]++;
+            PIN_MutexUnlock(&lock_mutex);
+
             if(special)
-                timed_lockset->lock_special(mutex, get_next_id(tdata));
+                tdata->current_timedlockset.lock_special(mutex, get_next_id(tdata));
             else
-                timed_lockset->lock(mutex, get_next_id(tdata));
+                tdata->current_timedlockset.lock(mutex, get_next_id(tdata));
             break;
 
 
         case trace::Instruction::RWUNLOCK: 
         case trace::Instruction::UNLOCK:
+
+            PIN_MutexLock(&lock_mutex);
+            unlocking_count[mutex][GetBacktrace(ctxt, backtrace_depth, tdata->stack)]++;
+            PIN_MutexUnlock(&lock_mutex);
+
             if(special)
-                timed_lockset->unlock_special(mutex);
+                tdata->current_timedlockset.unlock_special(mutex);
             else
-                timed_lockset->unlock(mutex);
+                tdata->current_timedlockset.unlock(mutex);
             break;
 
 
@@ -424,9 +480,12 @@ void ProcessThreadCreate(uint64_t tid) {
     VectorClock clock = tdata->vector_clocks.back();
 
     clock.update(tid);
+    
+    creator_thread_clock = clock;
+
+    clock.update(tid);
 
     tdata->vector_clocks.push_back(clock);
-    creator_thread_clock = tdata->vector_clocks.back();
 }
 
 void ProcessThreadInit(uint64_t tid, int64_t creator_tid) {
@@ -438,6 +497,7 @@ void ProcessThreadInit(uint64_t tid, int64_t creator_tid) {
         creator_clock = creator_thread_clock;
     } 
 
+    creator_clock.update(tid);
     creator_clock.update(tid);
 
     tdata->vector_clocks.push_back(creator_clock);
@@ -460,6 +520,23 @@ void ProcessThreadJoin(uint64_t tid, uint64_t exit_tid) {
 void ProcessThreadExit(uint64_t tid) {
     ThreadData * tdata = get_thread_data(tid);
 
+    if(check_unpersisted_stores) {
+        auto& mem_state = tdata->mem_state;
+        auto& flushed_mem_state = tdata->flushed_mem_state;
+
+        for(auto & entry_cl : mem_state) {
+            for(auto & entry_data : entry_cl.second) {
+                RegisterUnpersistedStore(tid, entry_data.first, entry_data.second, tdata->get_timedlockset(), NULL, false);
+            }    
+        }
+
+        for(auto & entry_cl : flushed_mem_state) {
+            for(auto & entry_data : entry_cl.second) {
+                RegisterUnpersistedStore(tid, entry_data.first, entry_data.second, tdata->get_timedlockset(), NULL, true);
+            }    
+        }
+    }
+
     VectorClock clock = tdata->vector_clocks.back();
 
     clock.update(tid);
@@ -471,138 +548,9 @@ void ProcessThreadExit(uint64_t tid) {
     PIN_MutexUnlock(&thread_exit_mutex);
 } 
 
-std::set<backtrace_t> CheckPMRacesPerThread(uint64_t tid, const RaceLikelyPoint& rlp) {
-    std::set<backtrace_t> races;
-    uint64_t start_address = rlp.address;
-    uint64_t size = rlp.size;
-    std::bitset<64> mask = rlp.mask;
-    pLockSet common_set = rlp.common_set;
-    VectorClock& clock = get_thread_data(tid)->vector_clocks[rlp.clock_i];
 
 
-    std::set<const lockset_set_t*> visited;
-
-    for(uint64_t access_tid = 0; access_tid < TLS_MAX_SIZE; access_tid++) {
-        ThreadData &thread_data = *get_thread_data(access_tid);
-
-        if(!thread_data.used)
-            continue;
-
-        if(access_tid == tid)
-            continue;
-
-        auto& access_points = thread_data.access_points_opt;
-
-        for(uint64_t address = start_address; address < start_address + size; address++) {
-            if(!mask.test(address - start_address))
-                continue;
-
-            if(!access_points.contains(address)) 
-                continue;
-            
-            for(const auto & access_entry : access_points[address]) {
-                backtrace_t backtrace;
-                uint64_t clock_i;
-                std::tie(backtrace, clock_i) = access_entry.first;
-
-                for(const lockset_set_t * locksets : access_entry.second) {
-                    if(visited.contains(locksets))
-                        continue;
-
-                    visited.insert(locksets);
-
-                    VectorClock & vc = thread_data.vector_clocks[clock_i];
-
-                    for(const pLockSet ls : *locksets) {
-                        if(!ls->simple_intersect(common_set)) {
-                            if(vc.is_concurrent(clock)) {
-                                races.insert(backtrace);
-                                goto found_race;
-                            }
-                        }
-                    }
-                }
-
-                found_race:
-                continue;
-            }
-
-        }
-    }
-    return races;
-}
-
-VOID CheckPMRaces(VOID *v) {
-
-    std::cerr << "-----------------------------" << std::endl;
-    std::cerr << "Checking for persistent races" << std::endl;
-    std::cerr << "-----------------------------" << std::endl;
-    
-    lockset_analysis_time -= realtime();
-
-    for(int i = 0; i < TLS_MAX_SIZE; i++) {
-        ThreadData &thread_data = *get_thread_data(i);
-
-        if(!thread_data.used)
-            continue;
-
-        auto & access_points = thread_data.access_points;
-        auto & access_points_opt = thread_data.access_points_opt;
-
-        for(const auto & access_iterator : access_points) {
-            uint64_t address = access_iterator.first.address;
-            backtrace_t trace = access_iterator.first.backtrace;
-            uint64_t clock_i = access_iterator.first.clock_i;
-            std::bitset<64> mask = access_iterator.first.mask;
-
-            const lockset_set_t * locksets = &access_iterator.second;
-            auto key = std::make_pair(trace, clock_i);
-
-            for(int i = 0; i < 64; i++) {
-                if(mask.test(i)) {
-
-                    auto & opt_info = access_points_opt[address+i][key];
-                    opt_info.push_back(locksets);
-                }
-            }        
-        }
-    }
-
-    std::map<std::array<backtrace_t, 2>, std::set<backtrace_t>> races_per_rlp;
-
-    for(int i = 0; i < TLS_MAX_SIZE; i++) {
-        ThreadData &thread_data = *get_thread_data(i);
-
-        if(!thread_data.used)
-            continue;
-
-        for(auto& vc : thread_data.vector_clocks) {
-            vc.update(i);
-        }
-
-        auto& race_likely_points = thread_data.race_likely_points;
-
-        for(const auto & rlp : race_likely_points) {
-            std::set<backtrace_t> races = CheckPMRacesPerThread(i, rlp);
-
-            if(races.size() == 0)
-                continue;
-            std::array<backtrace_t, 2> traces = {rlp.write_trace, rlp.fence_trace};
-
-            if(!races_per_rlp.contains(traces)) {
-                races_per_rlp[traces] = std::set<backtrace_t>();
-            }
-
-            auto & rlp_race = races_per_rlp[traces];
-
-            for(const auto & trace : races) {
-                rlp_race.insert(trace);
-            }
-        } 
-    }
-
-    lockset_analysis_time += realtime();
-
+void OutputRaces(reports_t &races_per_rlp, reports_t &unpersisted_races_per_rlp) {
     output_time -= realtime();
 
     std::ostream* p_trace_out = &std::cout;
@@ -621,8 +569,8 @@ VOID CheckPMRaces(VOID *v) {
         auto & traces = entry.first;
         auto & races = entry.second;
 
-        std::string write_symbols = GetBacktraceSymbols(traces[0]);
-        std::string fence_symbols = GetBacktraceSymbols(traces[1]);
+        std::string write_symbols = GetBacktraceSymbols(std::get<0>(traces));
+        std::string fence_symbols  = GetBacktraceSymbols(std::get<1>(traces));
 
         trace_out << "PM address written in:" << std::endl;
         trace_out << write_symbols << std::endl;
@@ -646,12 +594,241 @@ VOID CheckPMRaces(VOID *v) {
         trace_out << std::endl;
     }   
 
+    for(const auto &entry : unpersisted_races_per_rlp) {
+        auto & traces = entry.first;
+        auto & races = entry.second;
+
+        std::string write_symbols = GetBacktraceSymbols(std::get<0>(traces));
+
+        std::string ignore_symbols;
+        
+        if(std::get<1>(traces) == nullptr)
+            ignore_symbols = "<THREAD_EXIT>\n";
+        else    
+            ignore_symbols = GetBacktraceSymbols(std::get<1>(traces));
+
+        trace_out << "PM address written in:" << std::endl;
+        trace_out << write_symbols << std::endl;
+
+        if(std::get<2>(traces))
+            trace_out << "ignored by (marked for flush):" << std::endl;
+        else
+            trace_out << "ignored by:" << std::endl;
+
+        trace_out << ignore_symbols << std::endl;
+
+        trace_out << "can be acessed concurrently in: " << std::endl;
+        bool start = true;
+        for(const auto &access_trace : races) {
+            std::string access_symbols = GetBacktraceSymbols(access_trace);
+
+            if(!start) {
+                trace_out << "---" << std::endl;
+            }
+            start = false;
+
+            trace_out << access_symbols;  
+
+        }
+        trace_out << std::endl;
+    }  
+
     trace_out.flush();
     if (out_path != "") {
         fout.close();
     }
 
+    fout.open("lock_data");
+
+    for(auto entry : locking_count) {
+        uint64_t mutex = entry.first;
+        uint64_t lock_count = 0;
+        uint64_t unlock_count = 0;
+        for(auto trace : entry.second) {
+            lock_count += trace.second;
+        }
+
+        for(auto trace : unlocking_count[mutex]) {
+            unlock_count += trace.second;
+        }
+
+        if(lock_count == unlock_count) {
+            unlocking_count.erase(mutex);
+            continue;
+        }
+
+        fout << "MUTEX " << mutex << " LOCKED/UNLOCK differs" << std::endl;
+
+        for(auto trace : entry.second) {
+            fout << "LOCK " << trace.second << ": " << std::endl;
+            fout << GetBacktraceSymbols(trace.first) << std::endl;
+        }
+
+        for(auto trace : unlocking_count[mutex]) {
+            fout << "UNLOCK " << trace.second << ": " << std::endl;
+            fout << GetBacktraceSymbols(trace.first) << std::endl;
+        }
+        unlocking_count.erase(mutex);
+    }
+    
+    for(auto entry : unlocking_count) {
+        uint64_t mutex = entry.first;
+
+        fout << "MUTEX " << mutex << " UNLOCKED but never LOCKED" << std::endl;
+
+        for(auto trace : entry.second) {
+            fout << "UNLOCK " << trace.second << ": " << std::endl;
+            fout << GetBacktraceSymbols(trace.first) << std::endl;
+        }
+    }
+
+
+
     output_time += realtime();
+}
+
+uint64_t is_concurrent_exe = 0;
+uint64_t intersect_exe = 0;
+std::set<backtrace_t> CheckPMRacesPerThread(uint64_t tid, uint64_t write_address, pLockset write_set, VectorClock& write_clock) {
+    std::set<backtrace_t> racy_loads;
+
+    for(uint64_t load_tid = 0; load_tid < TLS_MAX_SIZE; load_tid++) {
+        ThreadData &thread_data = *get_thread_data(load_tid);
+
+        if(!thread_data.used)
+            continue;
+
+        if(load_tid == tid)
+            continue;
+
+        auto& race_likely_loads = thread_data.race_likely_loads_opt;
+
+        if(!race_likely_loads.contains(write_address)) 
+            continue;
+        
+        for(const auto & load_entry : race_likely_loads.at(write_address)) {
+            backtrace_t backtrace;
+            uint64_t clock_i;
+            std::tie(backtrace, clock_i) = load_entry.first;
+
+            if(racy_loads.contains(backtrace))
+                continue;
+
+            /*VectorClock & vc = thread_data.vector_clocks[clock_i];
+            is_concurrent_exe++;
+            if(!vc.is_concurrent(write_clock)) 
+                continue;*/
+            
+
+            for(const pLockset ls : load_entry.second) {
+                intersect_exe++;
+                if(!ls->short_intersect(write_set)) {
+                    racy_loads.insert(backtrace);
+                    break;
+                }
+            }
+        }
+    }
+
+    return racy_loads;
+}
+
+
+VOID CheckPMRaces(VOID *v) {
+    std::cerr << "------------------------------" << std::endl;
+    std::cerr << "Checking for persistency races" << std::endl;
+    std::cerr << "------------------------------" << std::endl;
+    
+    lockset_analysis_time -= realtime();
+
+    for(int tid = 0; tid < TLS_MAX_SIZE; tid++) {
+        ThreadData &thread_data = *get_thread_data(tid);
+
+        if(!thread_data.used)
+            continue;
+
+        auto & race_likely_loads = thread_data.race_likely_loads;
+        auto & race_likely_loads_opt = thread_data.race_likely_loads_opt;
+
+        for(const auto & access_iterator : race_likely_loads) {
+            uint64_t address = access_iterator.first.address;
+            backtrace_t trace = access_iterator.first.backtrace;
+            uint64_t clock_i = access_iterator.first.clock_i;
+            std::bitset<64> mask = access_iterator.first.mask;
+
+            const lockset_set_t & locksets = access_iterator.second;
+            auto key = std::make_pair(trace, clock_i);
+
+            for(int i = 0; i < 64; i++) {
+                if(mask.test(i)) {
+                    auto & opt_info = race_likely_loads_opt[address+i][key];
+                    opt_info.insert(locksets.cbegin(), locksets.cend());
+                }
+            }        
+        }
+    }
+
+    reports_t races_per_rlp;
+    reports_t unpersisted_races_per_rlp;
+
+    for(int tid = 0; tid < TLS_MAX_SIZE; tid++) {
+        ThreadData &thread_data = *get_thread_data(tid);
+
+        if(!thread_data.used)
+            continue;
+
+        auto& race_likely_stores = thread_data.race_likely_stores;
+
+        /*
+            Race likely stores optimized for analysis
+
+            (address, persisted) ->
+                (lockset) -> 
+                    (clock_i) ->
+                        (backtraces)[]
+        */
+
+        std::unordered_map<std::tuple<uint64_t, bool, bool>,
+            std::unordered_map<pLockset,
+                std::unordered_map<uint16_t,
+                    std::unordered_set<std::pair<backtrace_t, backtrace_t>>>>> race_likely_stores_opt;
+
+        for(const auto & rls : race_likely_stores) {
+            uint64_t write_address = rls.address;
+
+            race_likely_stores_opt[std::make_tuple(write_address, rls.persisted, rls.was_flushed)]
+                                  [rls.common_set]
+                                  [rls.clock_i].insert(std::make_pair(rls.write_trace, rls.fence_trace));
+        }
+
+        for(const auto & entry_adr : race_likely_stores_opt) {
+            for(const auto & entry_ls : entry_adr.second) {
+                for(const auto & entry_vc : entry_ls.second) {
+                    std::set<backtrace_t> racy_loads = CheckPMRacesPerThread(tid, 
+                        std::get<0>(entry_adr.first), // address
+                        entry_ls.first, // lockset
+                        thread_data.vector_clocks[entry_vc.first] // clock
+                    );
+
+                    if(racy_loads.size() == 0)
+                        continue; 
+ 
+                    for(const auto & trace : entry_vc.second) {
+                        std::tuple<backtrace_t, backtrace_t, bool> key = std::make_tuple(trace.first, trace.second, std::get<2>(entry_adr.first));
+
+                        if(std::get<1>(entry_adr.first))
+                            races_per_rlp[key].insert(racy_loads.cbegin(), racy_loads.cend());
+                        else
+                            unpersisted_races_per_rlp[key].insert(racy_loads.cbegin(), racy_loads.cend());
+                    }
+                }
+            }
+        }  
+    }
+
+    lockset_analysis_time += realtime();
+
+    OutputRaces(races_per_rlp, unpersisted_races_per_rlp);
 }
 
 /*
@@ -723,6 +900,7 @@ COUNT_TIME_GENERIC(instr_time, {
 
 void TraceRead(THREADID tid, const CONTEXT *ctxt, ADDRINT ip, ADDRINT address, uint32_t size, ADDRINT address2) {
 COUNT_TIME_GENERIC(instr_time, {
+    COUNT_LOAD;
     if(IsPMAddress(address, size, tid)) { 
         COUNT_PM_LOAD;
 
@@ -739,12 +917,34 @@ COUNT_TIME_GENERIC(instr_time, {
 })
 }
 
+void TraceCall(uint64_t tid, const CONTEXT *ctxt, ADDRINT address) {
+    get_thread_data(tid)->stack.push_back((void*) address);
+}
+
+void TraceRet(uint64_t tid, const CONTEXT *ctxt) {
+    get_thread_data(tid)->stack.pop_back();
+}
+
 VOID TraceInstructions(INS ins, VOID *v) {
     [[maybe_unused]] uint64_t tid = 0;
 COUNT_TIME_GENERIC(injection_time, {
     int opcode = INS_Opcode(ins);
 
-    if (INS_IsAtomicUpdate(ins)) {
+    if(INS_IsCall(ins)) {
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TraceCall, 
+                            IARG_THREAD_ID, 
+                            IARG_CONST_CONTEXT, 
+                            IARG_ADDRINT, INS_Address(ins),
+                            IARG_END);
+    }
+    else if(INS_IsRet(ins)) {
+        INS_InsertCall(ins, (INS_IsValidForIpointTakenBranch(ins) ? IPOINT_TAKEN_BRANCH : IPOINT_AFTER), 
+            (AFUNPTR)TraceRet, 
+            IARG_THREAD_ID, 
+            IARG_CONST_CONTEXT, 
+            IARG_END);
+    }
+    else if (INS_IsAtomicUpdate(ins)) {
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)TraceRMW,
                        IARG_THREAD_ID, 
                        IARG_CONST_CONTEXT, 
@@ -801,37 +1001,44 @@ COUNT_TIME_GENERIC(injection_time, {
 }
 
 
-void LockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void LockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_LOCK;
-    ProcessLock(tid, retAddr, trace::Instruction::LOCK, mutexAddress);
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::LOCK, mutexAddress);
 })
 }
 
-void WriteLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void WriteLockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_WRLOCK;
-    ProcessLock(tid, retAddr, trace::Instruction::WRLOCK, mutexAddress);
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::WRLOCK, mutexAddress);
 })
 }
 
-void ReadLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void ReadLockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_RDLOCK;
-    ProcessLock(tid, retAddr, trace::Instruction::RDLOCK, mutexAddress);
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::RDLOCK, mutexAddress);
 })
 }
 
-void TryLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void TryLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress, ADDRINT resultAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     ThreadData * tdata = get_thread_data(tid);
     tdata->try_lock_mutex = mutexAddress;
+    tdata->result_address = resultAddress;
     tdata->try_lock_return_address = retAddr;
 })
 }
+std::set<uint64_t> test_;
 
-void TryLockAfter(THREADID tid, ADDRINT result, UINT64 success, uint64_t negate) {
+void TryLockAfter(const CONTEXT * ctxt, THREADID tid, ADDRINT result, UINT64 success, uint64_t negate, uint64_t use_arg, LockType locktype) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
+    if(use_arg) {
+        ThreadData * tdata = get_thread_data(tid);
+        result = *((bool*)tdata->result_address);
+    }
+
     bool check = (result == success);
     if(negate)
         check = !check;
@@ -841,45 +1048,32 @@ COUNT_TIME_GENERIC2(instr_time, lock_time, {
         ThreadData * tdata = get_thread_data(tid);
         uint64_t retAddr = tdata->try_lock_return_address;
         uint64_t mutexAddress = tdata->try_lock_mutex;
-
-        ProcessLock(tid, retAddr, trace::Instruction::TRY_LOCK, mutexAddress);
-    }
-})
-}
-void TryWriteLockAfter(THREADID tid, ADDRINT result) {
-COUNT_TIME_GENERIC2(instr_time, lock_time, {
-    if(result == 0) {
-        COUNT_WRLOCK;
-        ThreadData * tdata = get_thread_data(tid);
-        uint64_t retAddr = tdata->try_lock_return_address;
-        uint64_t mutexAddress = tdata->try_lock_mutex;
-        ProcessLock(tid, retAddr, trace::Instruction::TRY_WRLOCK, mutexAddress);
-    }
-})
-}
-void TryReadLockAfter(THREADID tid, ADDRINT result) {
-COUNT_TIME_GENERIC2(instr_time, lock_time, {
-    if(result == 0) {
-        COUNT_RDLOCK;
-        ThreadData * tdata = get_thread_data(tid);
-        uint64_t retAddr = tdata->try_lock_return_address;
-        uint64_t mutexAddress = tdata->try_lock_mutex;
-        ProcessLock(tid, retAddr, trace::Instruction::TRY_RDLOCK, mutexAddress);
-    }
+        switch(locktype) {
+        case LockType::MUTEX:
+            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_LOCK, mutexAddress);
+            break;
+        case LockType::WRITE:
+            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_WRLOCK, mutexAddress);
+            break;
+        case LockType::READ:
+            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_RDLOCK, mutexAddress);
+            break;
+        }
+    } 
 })
 }
 
-void UnlockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void UnlockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_UNLOCK;
-    ProcessLock(tid, retAddr, trace::Instruction::UNLOCK, mutexAddress);
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::UNLOCK, mutexAddress);
 })
 }
 
-void RWUnlockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void RWUnlockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_RWUNLOCK;
-    ProcessLock(tid, retAddr, trace::Instruction::RWUNLOCK, mutexAddress);
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::RWUNLOCK, mutexAddress);
 })
 }
 
@@ -935,12 +1129,12 @@ VOID TraceThreadStart(THREADID tid, CONTEXT *ctxt, INT32 flags, VOID *v) {
     ProcessThreadInit(tid, creator_thread_id);
 }
 
-VOID TraceAdqRelBefore(THREADID tid, ADDRINT retAddr, UINT64 id) {
-    ProcessLock(tid, retAddr, trace::Instruction::LOCK, id, true);
+VOID TraceAdqRelBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, UINT64 id) {
+    ProcessLock(ctxt, tid, retAddr, trace::Instruction::LOCK, id, true);
 }
 
-VOID TraceAdqRelAfter(THREADID tid, UINT64 id) {
-    ProcessLock(tid, 0, trace::Instruction::UNLOCK, id, true);
+VOID TraceAdqRelAfter(const CONTEXT * ctxt, THREADID tid, UINT64 id) {
+    ProcessLock(ctxt, tid, 0, trace::Instruction::UNLOCK, id, true);
 }
 
 
@@ -967,16 +1161,11 @@ int PthreadJoinReplacement(THREADID tid,
 }
 
 VOID TraceThreadExit(THREADID tid, const CONTEXT *ctxt, INT32 code, VOID *v) {
-    ProcessThreadExit(tid);
-
-    for(const auto ele : locksets_cache) {
-        assert((void*)ele != (void*)get_thread_data(tid)->timed_lockset.lockset);
-    }
+    ProcessThreadExit(tid); 
 
     SUM_GLOBAL_INSTRUCTION_COUNT
     SUM_GLOBAL_TIME_COUNT
 }
-
 
 
 VOID ImageLoad(IMG img, VOID *v) {
@@ -989,42 +1178,23 @@ COUNT_TIME_GENERIC(image_time, {
     for(const auto & config : configs) {
         for(const auto & adqConfig : config.adquire) {
             if(adqConfig.type == MUTEX)
-                InstrumentLockRoutine(img, adqConfig.name.c_str(), 
-                    (AFUNPTR) LockBefore, nullptr, adqConfig.mutex_id_arg);
+                InstrumentLockRoutine(img, (AFUNPTR) LockBefore, adqConfig);
             else if(adqConfig.type == WRITE)
-                InstrumentLockRoutine(img, adqConfig.name.c_str(), 
-                    (AFUNPTR) WriteLockBefore, nullptr, adqConfig.mutex_id_arg);
+                InstrumentLockRoutine(img, (AFUNPTR) WriteLockBefore, adqConfig);
             else if(adqConfig.type == READ)
-                InstrumentLockRoutine(img, adqConfig.name.c_str(), 
-                    (AFUNPTR) ReadLockBefore, nullptr, adqConfig.mutex_id_arg);
+                InstrumentLockRoutine(img, (AFUNPTR) ReadLockBefore, adqConfig);
         }
         for(const auto & relConfig : config.release) {
             if(relConfig.type == MUTEX)
-                InstrumentLockRoutine(img, relConfig.name.c_str(), 
-                    (AFUNPTR) UnlockBefore, nullptr, relConfig.mutex_id_arg);
+                InstrumentLockRoutine(img, (AFUNPTR) UnlockBefore, relConfig);
             else
-                InstrumentLockRoutine(img, relConfig.name.c_str(), 
-                    (AFUNPTR) RWUnlockBefore, nullptr, relConfig.mutex_id_arg);
+                InstrumentLockRoutine(img, (AFUNPTR) RWUnlockBefore, relConfig);
         }
         for(const auto & try_adqConfig : config.try_adquire) {
-            if(try_adqConfig.type == MUTEX)
-                InstrumentLockRoutine(img, try_adqConfig.name.c_str(), 
-                    (AFUNPTR) TryLockBefore, (AFUNPTR) TryLockAfter, 
-                    try_adqConfig.mutex_id_arg, try_adqConfig.success_value, try_adqConfig.success_is_failure);
-
-            else if(try_adqConfig.type == WRITE) 
-                InstrumentLockRoutine(img, try_adqConfig.name.c_str(), 
-                    (AFUNPTR) TryLockBefore, (AFUNPTR) TryWriteLockAfter, 
-                    try_adqConfig.mutex_id_arg, try_adqConfig.success_value, try_adqConfig.success_is_failure);
-                
-            else if(try_adqConfig.type == READ)
-                InstrumentLockRoutine(img, try_adqConfig.name.c_str(), 
-                    (AFUNPTR) TryLockBefore, (AFUNPTR) TryReadLockAfter, 
-                    try_adqConfig.mutex_id_arg, try_adqConfig.success_value, try_adqConfig.success_is_failure);
-
+            InstrumentLockRoutine(img, (AFUNPTR) TryLockBefore, try_adqConfig, (AFUNPTR) TryLockAfter);
         }
 
-        uint64_t special_mutex = LockSet::register_special_mutex();
+        uint64_t special_mutex = Lockset::register_special_mutex();
         for(const std::string & adq_relFunc : config.adq_rel) {
             InstrumentAdqRelRoutine(img, adq_relFunc.c_str(), 
                     (AFUNPTR)TraceAdqRelBefore, 
@@ -1056,7 +1226,7 @@ COUNT_TIME_GENERIC(image_time, {
             IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
             IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
             IARG_END);
-    }   
+    } 
 }) 
 }
 
@@ -1073,6 +1243,7 @@ VOID Fini(INT32 code, VOID *v) {
     PIN_MutexFini(&lockset_cache_mutex);
     PIN_MutexFini(&timedlockset_cache_mutex);
     PIN_MutexFini(&backtrace_mutex);
+    PIN_MutexFini(&lock_mutex);
 
     PIN_SemaphoreFini(&thread_creation_semaphore);  
 
@@ -1091,10 +1262,10 @@ VOID Fini(INT32 code, VOID *v) {
         if(!thread_data.used)
             continue;
 
-        n_rlps += thread_data.race_likely_points.size();
+        n_rlps += thread_data.race_likely_stores.size();
         vcs_n += thread_data.vector_clocks.size();
-        vector_cap += thread_data.race_likely_points.capacity() * sizeof(RaceLikelyPoint);
-        access_point_size += get_map_size(thread_data.access_points);
+        vector_cap += thread_data.race_likely_stores.capacity() * sizeof(StoreFenceData);
+        access_point_size += get_map_size(thread_data.race_likely_loads);
         mem_state_size += get_map_size(thread_data.mem_state);
         mem_state_size += get_map_size(thread_data.flushed_mem_state);
 
@@ -1112,8 +1283,8 @@ VOID Fini(INT32 code, VOID *v) {
     OUTPUT_TIME_COUNT
 
     std::cerr << "-- General Data Structures Usage (Approximation) --" << std::endl;
-    std::cerr << "    WriteData (KB):      " << mem_state_size / 1000 << std::endl;
-    std::cerr << "    RaceLikelyPoint(KB): " << vector_cap / 1000 << std::endl;
+    std::cerr << "    StoreData (KB):      " << mem_state_size / 1000 << std::endl;
+    std::cerr << "    StoreFenceData(KB): " << vector_cap / 1000 << std::endl;
     std::cerr << "    Access points(KB):   " << access_point_size / 1000 << std::endl;
     std::cerr << "    Trace(#):            " << get_traces_size() << std::endl;
     std::cerr << "    Vector Clocks(#):    " << vcs_n << std::endl;
@@ -1124,12 +1295,17 @@ VOID Fini(INT32 code, VOID *v) {
 
     std::cerr << std::endl;
 
-    std::cerr << "-- LockSet Analysis Report --" << std::endl;
+    std::cerr << "-- Lockset Analysis Report --" << std::endl;
     std::cerr << "    Race Likely Points Compared (#): " << n_rlps << std::endl; 
     std::cerr << "    Analysis Time (s): " << (double) lockset_analysis_time / 1000000000 << std::endl;
     std::cerr << "    Output Time (s): " << (double) output_time / 1000000000 << std::endl;
     std::cerr << "    Tool Execution Time (s): " << (double) tool_execution_time / 1000000000 << std::endl;
+    std::cerr << "    Is Concurrent (#): " << is_concurrent_exe << std::endl;
+    std::cerr << "    Intersect (#): " << intersect_exe << std::endl;
     std::cerr << std::endl;
+
+
+
 }
 
 void HandleKnobs() {
@@ -1137,9 +1313,12 @@ void HandleKnobs() {
     pm_mount = KnobPMMount.Value().c_str();
     use_init_removal_heuristic_n = (uint64_t) KnobInitRemoval.Value();
     backtrace_depth = (uint64_t) KnobBacktraceDepth.Value();
+    check_unpersisted_stores = KnobCheckUnpersistedWrites.Value();
 
     debug("Backtrace depth - %ld\n", backtrace_depth);
     debug("Using Initialization Removal Heuristic for %ld threads\n", use_init_removal_heuristic_n);
+    if(check_unpersisted_stores)
+        debug("Checking unpersisted writes in analysis");
 
     std::vector<MutexConfig> *configs = new std::vector<MutexConfig>();
 
@@ -1167,6 +1346,7 @@ int main(int argc, char *argv[]) {
     PIN_MutexInit(&lockset_cache_mutex);
     PIN_MutexInit(&timedlockset_cache_mutex);
     PIN_MutexInit(&backtrace_mutex);
+    PIN_MutexInit(&lock_mutex);
 
     PIN_SemaphoreInit(&thread_creation_semaphore);
 

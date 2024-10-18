@@ -1,6 +1,7 @@
 #ifndef __HAWKSET_LOGGER_HPP__
 #define __HAWKSET_LOGGER_HPP__
 
+
 // ----------------- DEBUGGING INFORMATION OUTPUT ----------------
 #ifdef DEBUG
 #define debug(...) fprintf(stderr, "[DBG] " __VA_ARGS__)
@@ -20,6 +21,7 @@
 struct alignas(64) LoggingData {
     uint64_t pm_stores = 0;
     uint64_t stores = 0;
+    uint64_t loads = 0;
     uint64_t pm_loads = 0;
     uint64_t flushes = 0;
     uint64_t fences = 0;
@@ -47,6 +49,7 @@ struct alignas(64) LoggingData {
 
 std::atomic_ulong pm_stores = 0;
 std::atomic_ulong stores = 0;
+std::atomic_ulong loads = 0;
 std::atomic_ulong pm_loads = 0;
 std::atomic_ulong flushes = 0;
 std::atomic_ulong fences = 0;
@@ -88,6 +91,7 @@ inline LoggingData * get_logging_data(uint64_t tid) {
 #define COUNT_PM_LOAD get_logging_data(tid)->pm_loads++
 #define COUNT_PM_NT_STORE get_logging_data(tid)->pm_nt_stores++
 #define COUNT_STORE get_logging_data(tid)->stores++
+#define COUNT_LOAD get_logging_data(tid)->loads++
 #define COUNT_FLUSH get_logging_data(tid)->flushes++
 #define COUNT_FENCE get_logging_data(tid)->fences++
 #define COUNT_RMW get_logging_data(tid)->rmw++
@@ -101,6 +105,7 @@ inline LoggingData * get_logging_data(uint64_t tid) {
     pm_loads += get_logging_data(tid)->pm_loads; \
     pm_nt_stores += get_logging_data(tid)->pm_nt_stores; \
     stores += get_logging_data(tid)->stores; \
+    loads += get_logging_data(tid)->loads; \
     flushes += get_logging_data(tid)->flushes; \
     fences += get_logging_data(tid)->fences; \
     rmw += get_logging_data(tid)->rmw; \
@@ -114,6 +119,8 @@ inline LoggingData * get_logging_data(uint64_t tid) {
     std::cerr << "    pm stores:    " << pm_stores << std::endl; \
     std::cerr << "    pm nt stores: " << pm_nt_stores << std::endl; \
     std::cerr << "    pm loads:     " << pm_loads << std::endl; \
+    std::cerr << "    loads:        " << loads << std::endl; \
+    std::cerr << "    stores:       " << stores << std::endl; \
     std::cerr << "    flushes:      " << flushes << std::endl; \
     std::cerr << "    fences:       " << fences << std::endl; \
     std::cerr << "    rmw:          " << rmw << std::endl; \
@@ -127,6 +134,7 @@ inline LoggingData * get_logging_data(uint64_t tid) {
 #define COUNT_PM_LOAD
 #define COUNT_PM_NT_STORE
 #define COUNT_STORE
+#define COUNT_LOAD
 #define COUNT_FLUSH
 #define COUNT_FENCE
 #define COUNT_RMW

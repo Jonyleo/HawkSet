@@ -32,13 +32,16 @@ struct VectorClock {
 		for(auto it = vc.clock.begin(); it != vc.clock.end(); it++) {
 			uint64_t timestamp = it->second;
 			uint64_t tid = it->first;
-			if(!clock.contains(tid))
+			if(!clock.contains(tid)) {
 				lesser = true;
+			}
 			else {
-				if(clock.at(tid) < timestamp)
+				if(clock.at(tid) < timestamp) {
 					lesser = true;
-				else if (clock.at(tid) > timestamp)
+				}
+				else if (clock.at(tid) > timestamp) {
 					greater = true;
+				}
 			}
 		}
 
@@ -65,10 +68,12 @@ struct VectorClock {
 			return os;
 		}
 
+		os << "[ ";
+
 		for(auto it = vc.clock.begin(); it != vc.clock.end(); it++) {
-			os << it->first << ": " << it->second << ", ";
+			os << "(" <<it->first << ": " << it->second << ") ";
 		}
-		os << std::endl;
+		os << "]";
 
 		return os;
 	}
