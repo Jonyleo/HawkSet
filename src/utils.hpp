@@ -291,7 +291,7 @@ size_t get_traces_size() {
     return s;
 }
 
-int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth, bool frame_pointer_only) {
+int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth) {
     if(depth==0)
         return 0;
 
@@ -306,15 +306,6 @@ int CustomBackTrace(const CONTEXT *ctxt, void ** addresses, uint64_t depth, bool
 
     uint64_t* frame_ptr = (uint64_t*) PIN_GetContextReg(ctxt, REG_RBP);
     uint64_t* stack_ptr = (uint64_t *) PIN_GetContextReg(ctxt, REG_RSP);
-    
-    if(i < depth && frame_ptr && stack_ptr) {
-        if(!frame_pointer_only) {
-            uint64_t p = *(stack_ptr);
-            if(p) {
-                addresses[i++] = (void *) p;
-            }
-        }
-    }
 
     while(i < depth && frame_ptr) {
         if(((uint64_t)(std::max(frame_ptr, stack_ptr) - std::min(frame_ptr,stack_ptr))) > 0x10000) {
@@ -345,13 +336,15 @@ backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth, std::vector<void*>
 
     std::vector<void*> vec(addresses, addresses + num_addresses);*/
     
-    //num_addresses = CustomBackTrace(ctxt, addresses, depth, frame_pointer_only);
+    void * addresses[depth];
+    int num_addresses = CustomBackTrace(ctxt, addresses, depth);
+    std::vector<void*> vec(addresses, addresses + num_addresses);
 
 
 
-    std::vector<void*> vec(trace.rbegin(), trace.rend());
-    vec.insert(vec.begin(), (void*) PIN_GetContextReg(ctxt, REG_INST_PTR));
-    
+//    std::vector<void*> vec(trace.rbegin(), trace.rend());
+//    vec.insert(vec.begin(), (void*) PIN_GetContextReg(ctxt, REG_INST_PTR));
+
     PIN_MutexLock(&backtrace_mutex);
 
     auto vec_it = backtraces.find(&vec);
@@ -649,7 +642,6 @@ void InstrumentAdqRelRoutine(IMG img, const char * name, AFUNPTR beforePtr, AFUN
         RTN_Open(routine);
 
         RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
-                                IARG_CONST_CONTEXT,
                                 IARG_THREAD_ID,
                                 IARG_RETURN_IP,
                                 IARG_UINT64, value_passed,
@@ -657,7 +649,6 @@ void InstrumentAdqRelRoutine(IMG img, const char * name, AFUNPTR beforePtr, AFUN
 
 
         RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
-                                IARG_CONST_CONTEXT,
                                 IARG_THREAD_ID,
                                 IARG_UINT64, value_passed,
                                 IARG_END);
@@ -696,7 +687,6 @@ void InstrumentLockRoutine(IMG img, AFUNPTR beforePtr, const MutexFunctionInfo &
             
 
             RTN_InsertCall(routine, IPOINT_AFTER, (AFUNPTR) afterPtr,
-                                        IARG_CONST_CONTEXT,
                                         IARG_THREAD_ID,
                                         IARG_FUNCRET_EXITPOINT_VALUE,
                                         IARG_UINT64, info.success_value,
@@ -706,7 +696,6 @@ void InstrumentLockRoutine(IMG img, AFUNPTR beforePtr, const MutexFunctionInfo &
 
         } else {
             RTN_InsertCall(routine, IPOINT_BEFORE, beforePtr,
-                                IARG_CONST_CONTEXT,
                                 IARG_THREAD_ID,
                                 IARG_RETURN_IP,
                                 IARG_FUNCARG_ENTRYPOINT_VALUE, info.mutex_id_arg,

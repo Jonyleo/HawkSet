@@ -99,12 +99,6 @@ PIN_MUTEX variable_accessed_mutex;
 PIN_MUTEX thread_creation_mutex;
 PIN_MUTEX thread_exit_mutex;
 PIN_MUTEX backtrace_mutex;
-PIN_MUTEX lock_mutex;
-
-// mutex -> trace -> count
-std::map<uint64_t, std::map<backtrace_t, uint64_t>> locking_count;
-std::map<uint64_t, std::map<backtrace_t, uint64_t>> unlocking_count;
-
 
 typedef std::set<pLockset> lockset_set_t;
 
@@ -431,7 +425,7 @@ void ProcessFence(uint64_t tid, uint64_t ip, bool is_rmw, const CONTEXT *ctxt, u
     mem_state.clear();
 }
 
-void ProcessLock(const CONTEXT * ctxt, uint64_t tid, uint64_t ip, trace::Instruction locktype, uint64_t mutex, bool special = false) {
+void ProcessLock(uint64_t tid, uint64_t ip, trace::Instruction locktype, uint64_t mutex, bool special = false) {
     ThreadData * tdata = get_thread_data(tid);
 
     tdata->cached_timedlockset = NULL;
@@ -443,10 +437,6 @@ void ProcessLock(const CONTEXT * ctxt, uint64_t tid, uint64_t ip, trace::Instruc
         case trace::Instruction::LOCK:
         case trace::Instruction::WRLOCK:
         case trace::Instruction::RDLOCK:
-            PIN_MutexLock(&lock_mutex);
-            locking_count[mutex][GetBacktrace(ctxt, backtrace_depth, tdata->stack)]++;
-            PIN_MutexUnlock(&lock_mutex);
-
             if(special)
                 tdata->current_timedlockset.lock_special(mutex, get_next_id(tdata));
             else
@@ -456,11 +446,6 @@ void ProcessLock(const CONTEXT * ctxt, uint64_t tid, uint64_t ip, trace::Instruc
 
         case trace::Instruction::RWUNLOCK: 
         case trace::Instruction::UNLOCK:
-
-            PIN_MutexLock(&lock_mutex);
-            unlocking_count[mutex][GetBacktrace(ctxt, backtrace_depth, tdata->stack)]++;
-            PIN_MutexUnlock(&lock_mutex);
-
             if(special)
                 tdata->current_timedlockset.unlock_special(mutex);
             else
@@ -638,52 +623,6 @@ void OutputRaces(reports_t &races_per_rlp, reports_t &unpersisted_races_per_rlp)
         fout.close();
     }
 
-    fout.open("lock_data");
-
-    for(auto entry : locking_count) {
-        uint64_t mutex = entry.first;
-        uint64_t lock_count = 0;
-        uint64_t unlock_count = 0;
-        for(auto trace : entry.second) {
-            lock_count += trace.second;
-        }
-
-        for(auto trace : unlocking_count[mutex]) {
-            unlock_count += trace.second;
-        }
-
-        if(lock_count == unlock_count) {
-            unlocking_count.erase(mutex);
-            continue;
-        }
-
-        fout << "MUTEX " << mutex << " LOCKED/UNLOCK differs" << std::endl;
-
-        for(auto trace : entry.second) {
-            fout << "LOCK " << trace.second << ": " << std::endl;
-            fout << GetBacktraceSymbols(trace.first) << std::endl;
-        }
-
-        for(auto trace : unlocking_count[mutex]) {
-            fout << "UNLOCK " << trace.second << ": " << std::endl;
-            fout << GetBacktraceSymbols(trace.first) << std::endl;
-        }
-        unlocking_count.erase(mutex);
-    }
-    
-    for(auto entry : unlocking_count) {
-        uint64_t mutex = entry.first;
-
-        fout << "MUTEX " << mutex << " UNLOCKED but never LOCKED" << std::endl;
-
-        for(auto trace : entry.second) {
-            fout << "UNLOCK " << trace.second << ": " << std::endl;
-            fout << GetBacktraceSymbols(trace.first) << std::endl;
-        }
-    }
-
-
-
     output_time += realtime();
 }
 
@@ -714,10 +653,10 @@ std::set<backtrace_t> CheckPMRacesPerThread(uint64_t tid, uint64_t write_address
             if(racy_loads.contains(backtrace))
                 continue;
 
-            /*VectorClock & vc = thread_data.vector_clocks[clock_i];
+            VectorClock & vc = thread_data.vector_clocks[clock_i];
             is_concurrent_exe++;
             if(!vc.is_concurrent(write_clock)) 
-                continue;*/
+                continue;
             
 
             for(const pLockset ls : load_entry.second) {
@@ -1001,24 +940,24 @@ COUNT_TIME_GENERIC(injection_time, {
 }
 
 
-void LockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void LockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_LOCK;
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::LOCK, mutexAddress);
+    ProcessLock(tid, retAddr, trace::Instruction::LOCK, mutexAddress);
 })
 }
 
-void WriteLockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void WriteLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_WRLOCK;
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::WRLOCK, mutexAddress);
+    ProcessLock(tid, retAddr, trace::Instruction::WRLOCK, mutexAddress);
 })
 }
 
-void ReadLockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void ReadLockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_RDLOCK;
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::RDLOCK, mutexAddress);
+    ProcessLock(tid, retAddr, trace::Instruction::RDLOCK, mutexAddress);
 })
 }
 
@@ -1032,7 +971,7 @@ COUNT_TIME_GENERIC2(instr_time, lock_time, {
 }
 std::set<uint64_t> test_;
 
-void TryLockAfter(const CONTEXT * ctxt, THREADID tid, ADDRINT result, UINT64 success, uint64_t negate, uint64_t use_arg, LockType locktype) {
+void TryLockAfter(THREADID tid, ADDRINT result, UINT64 success, uint64_t negate, uint64_t use_arg, LockType locktype) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     if(use_arg) {
         ThreadData * tdata = get_thread_data(tid);
@@ -1050,30 +989,30 @@ COUNT_TIME_GENERIC2(instr_time, lock_time, {
         uint64_t mutexAddress = tdata->try_lock_mutex;
         switch(locktype) {
         case LockType::MUTEX:
-            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_LOCK, mutexAddress);
+            ProcessLock(tid, retAddr, trace::Instruction::TRY_LOCK, mutexAddress);
             break;
         case LockType::WRITE:
-            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_WRLOCK, mutexAddress);
+            ProcessLock(tid, retAddr, trace::Instruction::TRY_WRLOCK, mutexAddress);
             break;
         case LockType::READ:
-            ProcessLock(ctxt, tid, retAddr, trace::Instruction::TRY_RDLOCK, mutexAddress);
+            ProcessLock(tid, retAddr, trace::Instruction::TRY_RDLOCK, mutexAddress);
             break;
         }
     } 
 })
 }
 
-void UnlockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void UnlockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_UNLOCK;
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::UNLOCK, mutexAddress);
+    ProcessLock(tid, retAddr, trace::Instruction::UNLOCK, mutexAddress);
 })
 }
 
-void RWUnlockBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
+void RWUnlockBefore(THREADID tid, ADDRINT retAddr, ADDRINT mutexAddress) {
 COUNT_TIME_GENERIC2(instr_time, lock_time, {
     COUNT_RWUNLOCK;
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::RWUNLOCK, mutexAddress);
+    ProcessLock(tid, retAddr, trace::Instruction::RWUNLOCK, mutexAddress);
 })
 }
 
@@ -1129,12 +1068,12 @@ VOID TraceThreadStart(THREADID tid, CONTEXT *ctxt, INT32 flags, VOID *v) {
     ProcessThreadInit(tid, creator_thread_id);
 }
 
-VOID TraceAdqRelBefore(const CONTEXT * ctxt, THREADID tid, ADDRINT retAddr, UINT64 id) {
-    ProcessLock(ctxt, tid, retAddr, trace::Instruction::LOCK, id, true);
+VOID TraceAdqRelBefore(THREADID tid, ADDRINT retAddr, UINT64 id) {
+    ProcessLock(tid, retAddr, trace::Instruction::LOCK, id, true);
 }
 
-VOID TraceAdqRelAfter(const CONTEXT * ctxt, THREADID tid, UINT64 id) {
-    ProcessLock(ctxt, tid, 0, trace::Instruction::UNLOCK, id, true);
+VOID TraceAdqRelAfter(THREADID tid, UINT64 id) {
+    ProcessLock(tid, 0, trace::Instruction::UNLOCK, id, true);
 }
 
 
@@ -1243,7 +1182,6 @@ VOID Fini(INT32 code, VOID *v) {
     PIN_MutexFini(&lockset_cache_mutex);
     PIN_MutexFini(&timedlockset_cache_mutex);
     PIN_MutexFini(&backtrace_mutex);
-    PIN_MutexFini(&lock_mutex);
 
     PIN_SemaphoreFini(&thread_creation_semaphore);  
 
@@ -1303,9 +1241,6 @@ VOID Fini(INT32 code, VOID *v) {
     std::cerr << "    Is Concurrent (#): " << is_concurrent_exe << std::endl;
     std::cerr << "    Intersect (#): " << intersect_exe << std::endl;
     std::cerr << std::endl;
-
-
-
 }
 
 void HandleKnobs() {
@@ -1346,7 +1281,6 @@ int main(int argc, char *argv[]) {
     PIN_MutexInit(&lockset_cache_mutex);
     PIN_MutexInit(&timedlockset_cache_mutex);
     PIN_MutexInit(&backtrace_mutex);
-    PIN_MutexInit(&lock_mutex);
 
     PIN_SemaphoreInit(&thread_creation_semaphore);
 
