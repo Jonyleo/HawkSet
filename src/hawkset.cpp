@@ -658,7 +658,6 @@ std::set<backtrace_t> CheckPMRacesPerThread(uint64_t tid, uint64_t write_address
             if(!vc.is_concurrent(write_clock)) 
                 continue;
             
-
             for(const pLockset ls : load_entry.second) {
                 intersect_exe++;
                 if(!ls->short_intersect(write_set)) {
@@ -703,9 +702,11 @@ VOID CheckPMRaces(VOID *v) {
                     auto & opt_info = race_likely_loads_opt[address+i][key];
                     opt_info.insert(locksets.cbegin(), locksets.cend());
                 }
-            }        
+            }
         }
     }
+
+    std::cerr << lockset_analysis_time + realtime() << std::endl;
 
     reports_t races_per_rlp;
     reports_t unpersisted_races_per_rlp;
@@ -762,7 +763,7 @@ VOID CheckPMRaces(VOID *v) {
                     }
                 }
             }
-        }  
+        }
     }
 
     lockset_analysis_time += realtime();
