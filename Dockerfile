@@ -76,3 +76,9 @@ ENV PM_MOUNT=/mnt/pmem/
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 WORKDIR $TOOL_ROOT
+
+COPY src/ $TOOL_ROOT/src/
+COPY scripts/ $TOOL_ROOT/scripts/
+COPY examples/ $TOOL_ROOT/examples/
+
+RUN $TOOL_ROOT/scripts/build.sh
