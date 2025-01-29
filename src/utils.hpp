@@ -328,22 +328,29 @@ backtrace_t GetBacktrace(const CONTEXT *ctxt, uint64_t depth, std::vector<void*>
 
     backtrace_t ret = nullptr;
    
-    /*void * addresses[depth];
+    // Official PIN method used for getting backtraces (Expensive)
+
+    /*
+    void * addresses[depth];
     int num_addresses;
     PIN_LockClient();
     num_addresses = PIN_Backtrace(ctxt, addresses, depth);
     PIN_UnlockClient();
 
-    std::vector<void*> vec(addresses, addresses + num_addresses);*/
+    std::vector<void*> vec(addresses, addresses + num_addresses);
+    */
     
+    // Custom Stack rewind mechanism (Cheap, loses part of the context)
+
+    /*
     void * addresses[depth];
     int num_addresses = CustomBackTrace(ctxt, addresses, depth);
     std::vector<void*> vec(addresses, addresses + num_addresses);
+    */
 
-
-
-//    std::vector<void*> vec(trace.rbegin(), trace.rend());
-//    vec.insert(vec.begin(), (void*) PIN_GetContextReg(ctxt, REG_INST_PTR));
+    // Custom call/ret based mechanim (Cheap, mostly correct and complete)
+    std::vector<void*> vec(trace.rbegin(), trace.rend());
+    vec.insert(vec.begin(), (void*) PIN_GetContextReg(ctxt, REG_INST_PTR));
 
     PIN_MutexLock(&backtrace_mutex);
 
