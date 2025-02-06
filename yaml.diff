@@ -1,0 +1,39 @@
+diff --git a/src/Makefile b/src/Makefile
+new file mode 100644
+index 0000000..ffa9e41
+--- /dev/null
++++ b/src/Makefile
+@@ -0,0 +1,23 @@
++YAML_HEADER=yaml_private.h 
++YAML_SOURCES=api.c reader.c scanner.c parser.c loader.c writer.c emitter.c dumper.c
++YAML_OBJ=$(YAML_SOURCES:c=o)
++YAML_INCLUDE=-I../include
++YAML_VERSION= -D YAML_VERSION_MAJOR=0 -D YAML_VERSION_MINOR=2 -D YAML_VERSION_PATCH=5 -D YAML_VERSION_STRING=\"0.2.5\"
++
++
++# If the tool is built out of the kit, PIN_ROOT must be specified in the make invocation and point to the kit root.
++ifdef PIN_ROOT
++CONFIG_ROOT := $(PIN_ROOT)/source/tools/Config
++else
++CONFIG_ROOT := ../Config
++endif
++
++include $(CONFIG_ROOT)/makefile.config
++
++libyaml.a: 
++	$(CXX) $(TOOL_CXXFLAGS) -std=c++2a -c *.c $(YAML_INCLUDE) $(YAML_VERSION)
++	ar -rcs libyaml.a $(YAML_OBJ)
++
++include $(TOOLS_ROOT)/Config/makefile.default.rules
++
++
+diff --git a/src/Makefile.am b/src/Makefile.am
+deleted file mode 100644
+index 24cf89d..0000000
+--- a/src/Makefile.am
++++ /dev/null
+@@ -1,4 +0,0 @@
+-AM_CPPFLAGS = -I$(top_srcdir)/include -Wall
+-lib_LTLIBRARIES = libyaml.la
+-libyaml_la_SOURCES = yaml_private.h api.c reader.c scanner.c parser.c loader.c writer.c emitter.c dumper.c
+-libyaml_la_LDFLAGS = -no-undefined -release $(YAML_LT_RELEASE) -version-info $(YAML_LT_CURRENT):$(YAML_LT_REVISION):$(YAML_LT_AGE)

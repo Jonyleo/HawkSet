@@ -1,0 +1,47 @@
+#!/usr/bin/bash
+
+executable=$1
+args="${@:1}"
+pin=${PIN_ROOT}/pin
+pintool=${TOOL_ROOT}/src/obj-intel64/hawkset.so
+
+args=( $args )
+
+sep=-1
+
+for i in ${!args[@]} ; do
+	if [ ${args[i]} == "--" ] ; then
+		sep=$i 
+	fi
+done
+
+if [ $sep == "-1" ] ; then
+	application=args
+	tool_args=""
+else
+	tool_args=${args[@]::$sep}
+	application=${args[@]:$((sep+1))}
+fi
+
+if [ -z "$DEBUG" ] ;
+then
+	debug=""
+else
+	debug="-pause_tool 20"
+fi
+
+if [ -z "$PROFILE" ] ;
+then
+	profile=""
+else
+	profile="/usr/bin/time -v"
+fi
+
+PMEM_IS_PMEM_FORCE=1 \
+${profile} ${pin} ${debug}  \
+	-inline 0 \
+	-t ${pintool} \
+	-pm-mount ${PM_MOUNT} \
+	-cfg $TOOL_ROOT/config/pthread.cfg \
+	${tool_args} \
+	-- ${application}
