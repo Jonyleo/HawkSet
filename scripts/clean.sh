@@ -1,3 +1,3 @@
 #!/usr/bin/bash
 
-make -C ../src clean
+make -C $TOOL_ROOT/src clean

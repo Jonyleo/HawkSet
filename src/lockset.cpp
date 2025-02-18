@@ -1,10 +1,11 @@
 #include <cstring>
 #include <cassert>
 
+#include "pin.H"
+
 #include "lockset.hpp"
 
-
-MUTEX_DECL lock_register_mutex;
+PIN_MUTEX lock_register_mutex;
 std::map<uint64_t, uint64_t> Lockset::lock_index;
 std::atomic_ulong Lockset::lock_counter;
 
@@ -25,11 +26,11 @@ void Lockset::set_mutex(uint64_t mutex, bool val) {
 
 
 void Lockset::register_mutex(uint64_t mutex) {
-	MUTEX_LOCK(lock_register_mutex);
+	PIN_MutexLock(&lock_register_mutex);
 	if(!Lockset::lock_index.contains(mutex)) {
 		Lockset::lock_index[mutex] = lock_counter++;
 	}
-	MUTEX_UNLOCK(lock_register_mutex);
+	PIN_MutexUnlock(&lock_register_mutex);
 }
 
 uint64_t Lockset::get_index(uint64_t mutex) {

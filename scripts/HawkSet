@@ -16,7 +16,7 @@ for i in ${!args[@]} ; do
 done
 
 if [ $sep == "-1" ] ; then
-	application=args
+	application=$args
 	tool_args=""
 else
 	tool_args=${args[@]::$sep}

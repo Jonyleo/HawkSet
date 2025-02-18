@@ -3,8 +3,6 @@
 
 #include <cassert>
 
-#include "sync.hpp"
-
 /* * *
  *
  * Helper function definitions for Lockset Caching 
@@ -87,15 +85,15 @@ struct std::equal_to<pTimedLockset> {
     }
 };
 
-MUTEX_DECL lockset_cache_mutex;
+PIN_MUTEX lockset_cache_mutex;
 std::unordered_set<pLockset> locksets_cache;
 pLockset empty_lockset = new Lockset();
 
-MUTEX_DECL timedlockset_cache_mutex;
+PIN_MUTEX timedlockset_cache_mutex;
 std::unordered_set<pTimedLockset> timedlocksets_cache;
 
 pLockset lockset_cache_get(pLockset ls) {
-	MUTEX_LOCK(lockset_cache_mutex);
+	PIN_MutexLock(&lockset_cache_mutex);
 
 	auto lockset_iter = locksets_cache.find(ls);
 
@@ -112,12 +110,12 @@ pLockset lockset_cache_get(pLockset ls) {
 
 	auto ret = *lockset_iter;
 	
-	MUTEX_UNLOCK(lockset_cache_mutex);
+	PIN_MutexUnlock(&lockset_cache_mutex);
 	return ret;
 }
 
 pTimedLockset timedlockset_cache_get(pTimedLockset tls) {
-	MUTEX_LOCK(timedlockset_cache_mutex);
+	PIN_MutexLock(&timedlockset_cache_mutex);
 
 	auto timedlockset_iter = timedlocksets_cache.find(tls);
 
@@ -134,7 +132,7 @@ pTimedLockset timedlockset_cache_get(pTimedLockset tls) {
 
 	auto ret = *timedlockset_iter;
 
-	MUTEX_UNLOCK(timedlockset_cache_mutex);
+	PIN_MutexUnlock(&timedlockset_cache_mutex);
 	return ret;
 }
 

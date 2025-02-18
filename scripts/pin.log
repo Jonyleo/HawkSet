@@ -1,0 +1,11 @@
+Pin: pin-3.28-98749-6643ecee5
+Copyright 2002-2023 Intel Corporation.
+ [tid:68016] Pausing for 20 seconds to attach to process with pid 68016
+To load the debug info to gdb use:
+*****************************************************************
+set sysroot /not/existing/dir
+file
+add-symbol-file /home/oliveira/research/PhD/HawkSet-exp/HawkSet/src/obj-intel64/hawkset.so 0x7233ff00b450 -s .data 0x7233ff1b5a00 -s .bss 0x7233ff1b6400
+*****************************************************************
+
+ [tid:68016] Resuming

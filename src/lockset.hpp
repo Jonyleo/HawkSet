@@ -11,18 +11,16 @@
 #include <vector>
 #include <unordered_set>
 
-#include "sync.hpp"
-
 struct Lockset;
 struct TimedLockset;
 
 typedef TimedLockset const * pTimedLockset;
 typedef Lockset const * pLockset;
 
-extern MUTEX_DECL lock_register_mutex;
+extern PIN_MUTEX lock_register_mutex;
 
 class Lockset {
-private:
+public:
 	static std::map<uint64_t, uint64_t> lock_index;
 	static std::atomic_ulong lock_counter;
 
