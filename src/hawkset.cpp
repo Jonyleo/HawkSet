@@ -25,31 +25,34 @@
 #include "trace.hpp"
 #include "utils.hpp"
 
-#define USE_PIN_SYNC
 #include "lockset.hpp"
 #include "vector_clock.hpp"
 #include "logger.hpp"
-
 #include "cache.hpp"
 
 
 KNOB<std::string> KnobOutPath(KNOB_MODE_WRITEONCE, "pintool", "out",
-                             "", "directory for tool i/o");
+                             "", "Bug reports output");
 
-KNOB<std::string> KnobPMMount(KNOB_MODE_WRITEONCE, "pintool", "pm-mount",
+KNOB<std::string> KnobPMMount(KNOB_MODE_OVERWRITE, "pintool", "pm-mount",
                               "/mnt/pmem0/", "PM mount in filesystem");
 
 KNOB<int> KnobInitRemoval(KNOB_MODE_WRITEONCE, "pintool", "irh",
-                              "1", "Initialization removal heuristic level");
+                              "1", "Initialization removal heuristic (0 or 1)");
 
 KNOB<int> KnobBacktraceDepth(KNOB_MODE_WRITEONCE, "pintool", "bt-depth",
-                              "50", "Depth of backtraces reported (heavily affects performance)");
+                              "50", "Depth of backtraces reported");
 
 KNOB<std::string> KnobConfigFiles(KNOB_MODE_APPEND, "pintool", "cfg",
                               "", "Configuration file (repeatable)");
 
 KNOB<bool> KnobCheckUnpersistedWrites(KNOB_MODE_WRITEONCE, "pintool", "unpersisted",
                                         "0", "Use unpersisted writes in the analysis");
+
+void PrintUsage()
+{
+    PIN_ERROR("HawkSet: Automatic, Application-Agnostic, and Efficient Concurrent PM Bug Detection\n" + KNOB_BASE::StringKnobSummary() + "\n");
+}
 
 bool check_unpersisted_stores;
 
@@ -1271,7 +1274,11 @@ int main(int argc, char *argv[]) {
     INIT_TIME_COUNT
 
     PIN_InitSymbols();
-    PIN_Init(argc, argv);
+    if(PIN_Init(argc, argv)) {
+        PrintUsage();
+        return -1;
+    }
+ 
 
     HandleKnobs();
 
@@ -1294,7 +1301,7 @@ int main(int argc, char *argv[]) {
         
     PIN_AddSyscallEntryFunction(SyscallEntry, 0);
     PIN_AddSyscallExitFunction(SyscallExit, 0);
-
+    
     // Start the program, never returns
     PIN_StartProgram();
 
