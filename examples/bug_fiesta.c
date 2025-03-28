@@ -9,6 +9,7 @@
 
 #define CACHE_LINE_SIZE 64
 #define FILE_SIZE 1024UL*1024UL
+#define DEAULT_VALUE -1
 
 typedef struct node {
     struct node * left, * right;
@@ -84,80 +85,90 @@ struct pm_pool {
   union {
     struct {
       size_t cur;
-      pthread_mutex_t mutex
+      pthread_mutex_t mutex;
     } d;
     char p[CACHE_LINE_SIZE];
   } meta;
   char addr[];
 };
 
+pthread_mutex_t tree_lock;
+
 struct pm_pool * memory;
 size_t pm_ptr;
 
 char * PM_ALLOC(size_t size) {
-  pthread_mutex_lock(&memory.meta.d.mutex);
+  pthread_mutex_lock(&memory->meta.d.mutex);
 
-  char * ret = memory.addr + memory.meta.d.cur;
+  char * ret = memory->addr + memory->meta.d.cur;
 
-  memory.meta.d.cur += size;
+  memory->meta.d.cur += size;
 
-  flush(&memory.meta, sizeof(memory.meta));
+  flush((char*)&memory->meta, sizeof(memory->meta));
   fence();
 
-  pthread_mutex_unlock(&memory.meta.d.mutex);
+  pthread_mutex_unlock(&memory->meta.d.mutex);
   return ret;
 }
 
 node_t * new_node(char * k, int v) {
-  node_t * n =
-	PM_ALLOC(sizeof(node_t));
-  n->left = n->right = NULL; 
-  n->val = v;
-  n->key = PM_ALLOC(strlen(k)+1);
-  strcpy(n->key, k);
+  node_t * n = (node_t *) PM_ALLOC(sizeof(node_t));
+  n->left = n->right = NULL; // bug 
+  n->val = v; // bug
+  n->key = (char *) PM_ALLOC(strlen(k)+1); // bug 
+  strcpy(n->key, k); // bug
   return n;
 }
 
-void put_persist(char * k, int v) {
-  node_t * n = put(key, val);
-  FLUSH(n, sizeof(node_t));
-  FENCE();
-}
+
 
 node_t * put(char * k, int v) {
-  LOCK(&tree_lock)
+  pthread_mutex_lock(&tree_lock);
   node_t * n = *tree;
   while (n) {
     int cmp = strcmp(n->key, k);
     if (cmp == 0) {
       n->val = v;
-      UNLOCK(&tree_lock);
+      pthread_mutex_unlock(&tree_lock);
       return n;
     }
     else if (cmp > 0) {
       if(n->left == NULL) {
-        n->left = new_node(k, v);
-        UNLOCK(&tree_lock);
+        n->left = new_node(k, v); // bug
+        pthread_mutex_unlock(&tree_lock);
         return n;
       }
       n = n->left;
     }
-    else {...} // Same as left
+    else {
+      if(n->right == NULL) {
+        n->right = new_node(k, v);
+        pthread_mutex_unlock(&tree_lock);
+        return n;
+      }
+      n = n->right;
+    }
   }
 
-  *tree = new_node(key, val);
-  UNLOCK(&tree_lock);
+  *tree = new_node(k, v); // bug
+  pthread_mutex_unlock(&tree_lock);
   return *tree;
-}	
+} 
 
-node_t * get(char * k, int v) {
-  LOCK(&tree_lock)
+void put_persist(char * k, int v) {
+  node_t * n = put(k, v);
+  flush((char*)n, sizeof(node_t));
+  fence();
+}
+
+int get(char * k) {
+  pthread_mutex_lock(&tree_lock);
   node_t * n = *tree;
   while (n) {
     int cmp = strcmp(n->key, k);
     if (cmp == 0) {
       int res = n->val;
-      UNLOCK(&tree_lock);
+      pthread_mutex_unlock(&tree_lock);
       return res;
     }
     else if (cmp > 0)
@@ -165,45 +176,49 @@ node_t * get(char * k, int v) {
     else
       n = n->right;       
   }
-  UNLOCK(&tree_lock);
+  pthread_mutex_unlock(&tree_lock);
   return DEAULT_VALUE;
 }   
 
 void * get_thread(void * arg) {
+  int arr[] = {123, 122, 127, 125, 111, 110, 120};
 
-  return NULL;
+  for(int i = 0; i < sizeof(arr) / sizeof(int); i++) {
+    char str[10];
+    sprintf(str, "%d", arr[i]);
+    printf("%d\n", get(str));  
+  }
 }
 
 void * put_thread(void * arg) {
+  int arr[] = {123, 122, 127, 125, 111};
 
-  return NULL;
+  for(int i = 0; i < sizeof(arr) / sizeof(int); i++) {
+    char str[10];
+    sprintf(str, "%d", arr[i]);
+    put(str, arr[i]);
+  }
 }
 
 int main(int argc, char *argv[]) {
   size_t size;
 
-  open_pmem_pool(argv[1], &memory, &size);
+  open_pmem_pool(argv[1], (char **) &memory, &size);
 
-  pthread_mutex_init(ock, NULL);
+  pthread_mutex_init(&tree_lock, NULL);
 
-  tree = PM_ALLOC(sizeof(node_t *));
+  tree = (node_t **) PM_ALLOC(sizeof(node_t *));
   *tree = NULL;
-  flush(tree, sizeof(node_t *));
+  flush((char*)tree, sizeof(node_t *));
   fence();
   
-  put_persist("123", 123);
-  put_persist("122", 122);
-  put_persist("127", 127);
-  put_persist("125", 125);
-  put_persist("111", 111);
+  pthread_t pid, gid;
 
+  pthread_create(&pid, NULL, put_thread, NULL);
+  pthread_create(&gid, NULL, get_thread, NULL);
 
-  printf("%ld\n", get("123"));
-  printf("%ld\n", get("122"));
-  printf("%ld\n", get("127"));
-  printf("%ld\n", get("125"));
-  printf("%ld\n", get("111"));
-  printf("%ld\n", get("110"));
-  printf("%ld\n", get("120"));
+  pthread_join(pid, NULL);
+  pthread_join(gid, NULL);
+  
   return 0;
 }
