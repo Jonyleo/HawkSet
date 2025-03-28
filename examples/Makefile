@@ -1,14 +1,16 @@
-CC:= g++
-CFLAGS:= -pthread -std=c++2a -lpmem2
+CC:= gcc
+CFLAGS:= -pthread -lpmem2
 LIBS:= -lpmem2
 
-EXECUTABLES:=simple_race two_bugs no_race no_sync n_threads_init disjoint_access adq_rel test
+EXECUTABLES:=simple_race two_bugs no_race no_sync n_threads_init disjoint_access adq_rel test bug_fiesta
 
 CFLAGS += -ggdb -DDEBUG -O0
 
 
 all: ${EXECUTABLES}
 
+bug_fiesta: bug_fiesta.c
+	$(CC) $(CFLAGS) -o bug_fiesta bug_fiesta.c $(LIBS)
 
 simple_race: simple_race.c
 	$(CC) $(CFLAGS) -o simple_race simple_race.c $(LIBS)
